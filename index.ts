@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@mariozechner/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { discoverAgents, type AgentConfig } from "pi-subagents/agents.ts";
 import { runSync } from "pi-subagents/execution.ts";
 import type { Details, SingleResult, Usage } from "pi-subagents/types.ts";
@@ -15,8 +16,10 @@ const INACTIVITY_CHECK_MS = 30_000;
 const INACTIVITY_WINDOW_MS = 5 * 60_000;
 const STATUS_REFRESH_MS = 15_000;
 const HISTORY_LIMIT = 3;
+const DASHBOARD_MAX_ROWS = 6;
 const SNIPPET_LIMIT = 1_800;
 const VERIFIER_TOOLS = ["read", "bash", "grep", "find", "ls"];
+const OVERLAY_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_CONFIG_PATH = path.join(PACKAGE_DIR, "config.json");
@@ -99,6 +102,7 @@ Rules:
 
 type RunState = "running" | "verifying" | "stopping";
 type Verdict = "MET" | "NOT_MET";
+type AttemptStatus = "success" | "not_met" | "worker_failed" | "inactive";
 
 type ProgressUpdate = {
 	content?: Array<{ type?: string; text?: string }>;
@@ -139,9 +143,12 @@ interface VerificationResult {
 
 interface AttemptRecord {
 	attempt: number;
+	status: AttemptStatus;
 	reason: string;
+	summary: string;
 	workerSummary: string;
 	verifierSummary: string;
+	nextActions: string[];
 	verdict: Verdict;
 	startedAt: number;
 	finishedAt: number;
@@ -161,10 +168,12 @@ interface ActiveRun {
 	thinkingLevel: string;
 	startedAt: number;
 	attempt: number;
+	attemptStartedAt: number;
 	state: RunState;
 	lastActivityAt: number;
 	lastEvent: string;
 	history: AttemptRecord[];
+	dashboardExpanded: boolean;
 	stopRequested: boolean;
 	stopReason?: string;
 	currentAbort?: AbortController;
@@ -203,6 +212,25 @@ function formatDuration(ms: number): string {
 	if (minutes < 60) return `${minutes}m ago`;
 	const hours = Math.floor(minutes / 60);
 	return `${hours}h ago`;
+}
+
+function formatElapsed(ms: number): string {
+	const seconds = Math.max(0, Math.floor(ms / 1_000));
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	if (minutes === 0) return `${remainder}s`;
+	return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+	return Math.min(Math.max(value, min), max);
+}
+
+function getTuiSize(tui: { terminal?: { columns?: number; rows?: number } }): { width: number; height: number } {
+	return {
+		width: tui.terminal?.columns ?? process.stdout.columns ?? 120,
+		height: tui.terminal?.rows ?? process.stdout.rows ?? 40,
+	};
 }
 
 function sanitizePathSegment(value: string): string {
@@ -510,32 +538,163 @@ function buildVerifierTask(run: ActiveRun, workerSummary: string, reason: string
 	].join("\n\n");
 }
 
+function attemptStatusLabel(status: AttemptStatus): string {
+	switch (status) {
+		case "success":
+			return "success";
+		case "inactive":
+			return "inactive";
+		case "worker_failed":
+			return "worker failed";
+		default:
+			return "not met";
+	}
+}
+
+function attemptStatusColor(theme: Theme, status: AttemptStatus): string {
+	if (status === "success") return theme.fg("success", attemptStatusLabel(status));
+	if (status === "inactive") return theme.fg("warning", attemptStatusLabel(status));
+	if (status === "worker_failed") return theme.fg("error", attemptStatusLabel(status));
+	return theme.fg("warning", attemptStatusLabel(status));
+}
+
+function currentPhaseLabel(run: ActiveRun): string {
+	if (run.state === "running") return "running";
+	if (run.state === "verifying") return "verifying";
+	return "stopping";
+}
+
+function hasInFlightAttempt(run: ActiveRun): boolean {
+	return run.attempt > run.history.length && !run.stopRequested;
+}
+
+function getAttemptCounts(run: ActiveRun): { started: number; completed: number; successes: number; failures: number } {
+	const completed = run.history.length;
+	const successes = run.history.filter((item) => item.status === "success").length;
+	return {
+		started: run.attempt,
+		completed,
+		successes,
+		failures: completed - successes,
+	};
+}
+
+function summarizeAttempt(status: AttemptStatus, verification: VerificationResult, reason: string, workerSummary: string): string {
+	if (status === "success") return singleLine(verification.summary, 220);
+	if (status === "worker_failed") return singleLine(`${reason}. ${workerSummary}`, 220);
+	if (status === "inactive") return singleLine(`${reason}. ${verification.summary}`, 220);
+	const nextAction = verification.nextActions[0];
+	return singleLine(nextAction ? `${verification.summary}. Next: ${nextAction}` : verification.summary, 220);
+}
+
+function padCell(text: string, width: number): string {
+	const truncated = truncateToWidth(text, width, "…", true);
+	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+}
+
+function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): string[] {
+	const counts = getAttemptCounts(run);
+	const phase = currentPhaseLabel(run);
+	const elapsed = formatElapsed(Date.now() - run.attemptStartedAt);
+	const headline = truncateToWidth(
+		`${theme.fg("accent", "🎯 goal-driven")} ${theme.fg("muted", `${counts.started} experiments`)} ${theme.fg("success", `${counts.successes} success`)} ${theme.fg(counts.failures > 0 ? "warning" : "muted", `${counts.failures} failure`)} ${theme.fg("dim", "│")} ${theme.fg("warning", `#${run.attempt} ${phase} ${elapsed}`)}`,
+		width,
+		"…",
+		true,
+	);
+	const activity = truncateToWidth(
+		`${theme.fg("muted", "activity:")} ${run.lastEvent}`,
+		width,
+		"…",
+		true,
+	);
+	return [headline, activity];
+}
+
+function renderDashboardLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+	const counts = getAttemptCounts(run);
+	const lines = [
+		truncateToWidth(`${theme.fg("accent", "🎯 Goal-Driven")} ${theme.fg("muted", singleLine(run.goal, Math.max(20, width - 16)))}`, width, "…", true),
+		truncateToWidth(
+			`${theme.fg("muted", "Experiments:")} ${counts.started}  ${theme.fg("success", `${counts.successes} success`)}  ${theme.fg(counts.failures > 0 ? "warning" : "muted", `${counts.failures} failure`)}  ${theme.fg("warning", `active #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)}`,
+			width,
+			"…",
+			true,
+		),
+		truncateToWidth(`${theme.fg("muted", "Criteria:")} ${singleLine(run.criteria, 220)}`, width, "…", true),
+		truncateToWidth(`${theme.fg("muted", "Activity:")} ${run.lastEvent}`, width, "…", true),
+		truncateToWidth(`${theme.fg("muted", "Logs:")} ${run.debugDir}`, width, "…", true),
+		"",
+	];
+
+	if (headerHint) {
+		lines.push(truncateToWidth(theme.fg("dim", headerHint), width, "…", true));
+	}
+
+	const idxWidth = 4;
+	const durWidth = 9;
+	const resultWidth = 14;
+	const summaryWidth = Math.max(20, width - idxWidth - durWidth - resultWidth - 4);
+	lines.push(
+		truncateToWidth(
+			`${theme.fg("muted", padCell("#", idxWidth))}${theme.fg("muted", padCell("duration", durWidth))}${theme.fg("muted", padCell("result", resultWidth))}${theme.fg("muted", "summary")}`,
+			width,
+			"…",
+			true,
+		),
+	);
+	lines.push(truncateToWidth(theme.fg("borderMuted", "─".repeat(Math.max(0, width - 2))), width, "…", true));
+
+	const start = Math.max(0, run.history.length - maxRows);
+	if (start > 0) {
+		lines.push(truncateToWidth(theme.fg("dim", `… ${start} earlier experiments`), width, "…", true));
+	}
+
+	for (const item of run.history.slice(start)) {
+		const duration = formatElapsed(item.finishedAt - item.startedAt);
+		const row =
+			`${theme.fg("dim", padCell(String(item.attempt), idxWidth))}` +
+			`${theme.fg("text", padCell(duration, durWidth))}` +
+			`${padCell(attemptStatusColor(theme, item.status), resultWidth)}` +
+			`${theme.fg("muted", truncateToWidth(item.summary, summaryWidth, "…", true))}`;
+		lines.push(truncateToWidth(row, width, "…", true));
+	}
+
+	if (hasInFlightAttempt(run)) {
+		const spinner = OVERLAY_SPINNER[Math.floor(Date.now() / 120) % OVERLAY_SPINNER.length] ?? "•";
+		const activeSummary = run.state === "verifying"
+			? run.lastVerifierSummary ?? run.lastEvent
+			: run.lastEvent;
+		const row =
+			`${theme.fg("dim", padCell(String(run.attempt), idxWidth))}` +
+			`${theme.fg("warning", padCell(formatElapsed(Date.now() - run.attemptStartedAt), durWidth))}` +
+			`${padCell(theme.fg("warning", `${spinner} ${currentPhaseLabel(run)}`), resultWidth)}` +
+			`${theme.fg("text", truncateToWidth(singleLine(activeSummary, 220), summaryWidth, "…", true))}`;
+		lines.push(truncateToWidth(row, width, "…", true));
+	}
+
+	return lines;
+}
+
 function buildStatusLines(run: ActiveRun): string[] {
+	const counts = getAttemptCounts(run);
 	const lines = [
 		`🎯 Goal-Driven (${run.state})`,
 		`Subagent profile: ${run.agentName}`,
 		`Model: ${run.modelConfig.primary ?? "inherit current Pi model"}${run.modelConfig.exactTarget ? " (exact)" : ""}`,
 		`Goal: ${singleLine(run.goal, 120)}`,
-		`Attempt: ${run.attempt}`,
-		`Started: ${formatDuration(Date.now() - run.startedAt)}`,
+		`Criteria: ${singleLine(run.criteria, 120)}`,
+		`Experiments: ${counts.started} started, ${counts.successes} success, ${counts.failures} failure`,
+		`Current attempt: #${run.attempt} ${currentPhaseLabel(run)} (${formatElapsed(Date.now() - run.attemptStartedAt)})`,
 		`Last activity: ${formatDuration(Date.now() - run.lastActivityAt)}`,
 		`Last event: ${singleLine(run.lastEvent, 120)}`,
-		`Criteria: ${singleLine(run.criteria, 120)}`,
 		`Logs: ${run.debugDir}`,
 	];
 
-	if (run.lastWorkerSummary) {
-		lines.push(`Worker: ${singleLine(run.lastWorkerSummary, 120)}`);
-	}
-	if (run.lastFailureReason) {
-		lines.push(`Failure: ${singleLine(run.lastFailureReason, 120)}`);
-	}
-	if (run.lastVerifierSummary) {
-		lines.push(`Verifier: ${singleLine(run.lastVerifierSummary, 120)}`);
-	}
-
-	for (const item of run.history.slice(-2).reverse()) {
-		lines.push(`History #${item.attempt}: ${singleLine(item.verifierSummary, 120)}`);
+	for (const item of run.history.slice(-5).reverse()) {
+		lines.push(
+			`Experiment #${item.attempt} ${attemptStatusLabel(item.status)} (${formatElapsed(item.finishedAt - item.startedAt)}): ${singleLine(item.summary, 120)}`,
+		);
 	}
 
 	return lines;
@@ -554,13 +713,23 @@ function refreshUiStatus(): void {
 		return;
 	}
 
-	const label = activeRun.state === "running"
-		? `🎯 ${activeRun.agentName} #${activeRun.attempt}`
-		: activeRun.state === "verifying"
-			? "🔎 verifying"
+	const run = activeRun;
+	const counts = getAttemptCounts(run);
+	const label = run.state === "running"
+		? `🎯 ${counts.started} exp`
+		: run.state === "verifying"
+			? `🔎 verify #${run.attempt}`
 			: "⏹ stopping";
 	latestCtx.ui.setStatus(COMMAND_NAME, label);
-	latestCtx.ui.setWidget(COMMAND_NAME, buildStatusLines(activeRun));
+	latestCtx.ui.setWidget(COMMAND_NAME, (tui, theme) => ({
+		render(width: number): string[] {
+			const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+			return run.dashboardExpanded
+				? renderDashboardLines(run, theme, safeWidth, DASHBOARD_MAX_ROWS, "ctrl+x collapse • ctrl+shift+x fullscreen")
+				: renderCompactWidgetLines(run, theme, safeWidth);
+		},
+		invalidate(): void {},
+	}));
 }
 
 function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
@@ -688,7 +857,7 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 	}, STATUS_REFRESH_MS);
 
 	refreshUiStatus();
-	notify(`Goal-Driven started with '${run.agentName}'.`, "info");
+	notify(`Goal-Driven started with '${run.agentName}'. Use Ctrl+X for the experiment list and Ctrl+Shift+X for fullscreen.`, "info");
 
 	while (!run.stopRequested) {
 		run.attempt += 1;
@@ -697,7 +866,8 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 		run.lastEvent = `Starting ${run.agentName} attempt #${run.attempt}`;
 		refreshUiStatus();
 
-		const attemptStartedAt = Date.now();
+		run.attemptStartedAt = Date.now();
+		const attemptStartedAt = run.attemptStartedAt;
 		const workerRun = await runManagedSubagent(run, workerAgent, buildWorkerTask(run), "worker");
 		if (run.stopRequested) break;
 
@@ -721,9 +891,19 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 		if (run.stopRequested) break;
 
 		run.lastVerifierSummary = verification.summary;
+		const attemptStatus: AttemptStatus = verification.verdict === "MET"
+			? "success"
+			: workerRun.killedForInactivity
+				? "inactive"
+				: workerRun.result.exitCode === 0
+					? "not_met"
+					: "worker_failed";
+		const attemptSummary = summarizeAttempt(attemptStatus, verification, reason, workerSummary);
 		run.history.push({
 			attempt: run.attempt,
+			status: attemptStatus,
 			reason,
+			summary: attemptSummary,
 			workerSummary: singleLine(workerSummary, 280),
 			verifierSummary: singleLine(
 				verification.verdict === "MET"
@@ -731,11 +911,11 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 					: [verification.summary, ...verification.nextActions].join(" "),
 				280,
 			),
+			nextActions: verification.nextActions,
 			verdict: verification.verdict,
 			startedAt: attemptStartedAt,
 			finishedAt: Date.now(),
 		});
-		if (run.history.length > HISTORY_LIMIT) run.history = run.history.slice(-HISTORY_LIMIT);
 
 		if (verification.verdict === "MET") {
 			finalizeRun(run, `Goal-Driven succeeded: ${verification.summary}`, "info");
@@ -878,6 +1058,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				return;
 			}
 
+			const now = Date.now();
 			const run: ActiveRun = {
 				goal: setup.goal,
 				criteria: setup.criteria,
@@ -885,12 +1066,14 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				cwd: ctx.cwd,
 				modelConfig: buildRunModelConfig(ctx, config),
 				thinkingLevel: pi.getThinkingLevel(),
-				startedAt: Date.now(),
+				startedAt: now,
 				attempt: 0,
+				attemptStartedAt: now,
 				state: "running",
-				lastActivityAt: Date.now(),
+				lastActivityAt: now,
 				lastEvent: "Preparing Goal-Driven run",
 				history: [],
+				dashboardExpanded: false,
 				stopRequested: false,
 				agentName: selectedAgent.agent.name,
 				debugDir: await createRunDebugDir(),
@@ -901,6 +1084,86 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				const message = error instanceof Error ? error.message : String(error);
 				finalizeRun(run, `Goal-Driven crashed: ${message}`, "error");
 			});
+		},
+	});
+
+	pi.registerShortcut("ctrl+x", {
+		description: "Toggle Goal-Driven experiment dashboard",
+		handler: async (ctx) => {
+			latestCtx = ctx;
+			if (!activeRun) {
+				ctx.ui.notify("No Goal-Driven run is active.", "info");
+				return;
+			}
+			activeRun.dashboardExpanded = !activeRun.dashboardExpanded;
+			refreshUiStatus();
+		},
+	});
+
+	pi.registerShortcut("ctrl+shift+x", {
+		description: "Open fullscreen Goal-Driven experiment dashboard",
+		handler: async (ctx) => {
+			latestCtx = ctx;
+			const run = activeRun;
+			if (!run) {
+				ctx.ui.notify("No Goal-Driven run is active.", "info");
+				return;
+			}
+
+			await ctx.ui.custom<void>(
+				(tui, theme, _keybindings, done) => {
+					let scrollOffset = 0;
+					let lastViewportRows = 8;
+					let lastTotalRows = 0;
+					const timer = setInterval(() => tui.requestRender(), 120);
+
+					return {
+						render(width: number): string[] {
+							const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+							const viewportRows = Math.max(8, getTuiSize(tui).height - 4);
+							const content = renderDashboardLines(run, theme, safeWidth, Math.max(run.history.length + 1, DASHBOARD_MAX_ROWS), "↑↓/j/k scroll • pgup/pgdn • g/G • esc close");
+							lastTotalRows = content.length;
+							lastViewportRows = viewportRows;
+							const maxScroll = Math.max(0, lastTotalRows - viewportRows);
+							scrollOffset = clamp(scrollOffset, 0, maxScroll);
+							const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
+							const lines = [...visible];
+							while (lines.length < viewportRows) lines.push("");
+							const footer = lastTotalRows > viewportRows
+								? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, lastTotalRows)}/${lastTotalRows}`
+								: "";
+							lines.push(truncateToWidth(theme.fg("dim", `esc close • ctrl+x inline${footer}`), safeWidth, "…", true));
+							return lines;
+						},
+						handleInput(data: string): void {
+							const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
+							if (matchesKey(data, "escape") || data === "q") {
+								done(undefined);
+								return;
+							}
+							if (matchesKey(data, "up") || data === "k") scrollOffset = Math.max(0, scrollOffset - 1);
+							else if (matchesKey(data, "down") || data === "j") scrollOffset = Math.min(maxScroll, scrollOffset + 1);
+							else if (matchesKey(data, "pageUp") || data === "u") scrollOffset = Math.max(0, scrollOffset - lastViewportRows);
+							else if (matchesKey(data, "pageDown") || data === "d") scrollOffset = Math.min(maxScroll, scrollOffset + lastViewportRows);
+							else if (data === "g") scrollOffset = 0;
+							else if (data === "G") scrollOffset = maxScroll;
+							tui.requestRender();
+						},
+						invalidate(): void {},
+						dispose(): void {
+							clearInterval(timer);
+						},
+					};
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						width: "95%",
+						maxHeight: "90%",
+						anchor: "center" as const,
+					},
+				},
+			);
 		},
 	});
 }

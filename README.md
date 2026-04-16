@@ -65,6 +65,14 @@ It uses the worker configured in `pi-goal-driven` config, and uses either:
 
 When a config target is set, Goal-Driven does not append the current Pi thinking suffix like `:high`, so a configured model such as `gpt-5-4` stays `gpt-5-4`.
 
+While the loop is running, every worker cycle is shown as an **experiment** in the UI:
+
+- compact widget above the editor with live activity
+- counts for experiments, success, and failure
+- per-experiment duration and summary
+- `Ctrl+X` toggles the inline experiment dashboard
+- `Ctrl+Shift+X` opens a fullscreen scrollable dashboard
+
 ### `/goal-driven setup`
 
 Copies the default config to:
@@ -102,7 +110,7 @@ The config parser also accepts a flat shape:
 
 ### `/goal-driven status`
 
-Shows the current run status, including the per-run log directory.
+Shows the current run status, including experiment counts, recent experiment summaries, and the per-run log directory.
 
 Each attempt now writes worker/verifier output under:
 
