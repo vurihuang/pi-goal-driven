@@ -27,6 +27,7 @@ const GLOBAL_AGENT_DIR = getAgentDir();
 const GLOBAL_EXTENSION_DIR = path.join(GLOBAL_AGENT_DIR, "extensions", EXTENSION_NAME);
 const GLOBAL_CONFIG_PATH = path.join(GLOBAL_EXTENSION_DIR, "config.json");
 const GLOBAL_RUNS_DIR = path.join(GLOBAL_EXTENSION_DIR, "runs");
+const GLOBAL_LATEST_RUN_PATH = path.join(GLOBAL_EXTENSION_DIR, "latest-run.json");
 const GLOBAL_SETTINGS_PATH = path.join(GLOBAL_AGENT_DIR, "settings.json");
 const GLOBAL_SUBAGENTS_EXTENSION_PATH = path.join(GLOBAL_AGENT_DIR, "extensions", "pi-subagents", "index.ts");
 const PROJECT_CONFIG_CANDIDATES = [".pi-goal-driven.json", path.join(".pi", "pi-goal-driven.json")] as const;
@@ -159,6 +160,31 @@ interface ManagedSingleRun {
 	killedForInactivity: boolean;
 }
 
+interface PersistedRunSnapshot {
+	goal: string;
+	criteria: string;
+	filledPrompt: string;
+	cwd: string;
+	modelConfig: RunModelConfig;
+	thinkingLevel: string;
+	startedAt: number;
+	attempt: number;
+	attemptStartedAt: number;
+	state: RunState;
+	lastActivityAt: number;
+	lastEvent: string;
+	history: AttemptRecord[];
+	dashboardExpanded: boolean;
+	stopRequested: boolean;
+	stopReason?: string;
+	agentName: string;
+	debugDir: string;
+	lastWorkerSummary?: string;
+	lastFailureReason?: string;
+	lastVerifierSummary?: string;
+	archivedAt: number;
+}
+
 interface ActiveRun {
 	goal: string;
 	criteria: string;
@@ -186,6 +212,7 @@ interface ActiveRun {
 }
 
 let activeRun: ActiveRun | null = null;
+let latestArchivedRun: ActiveRun | null = null;
 let latestCtx: ExtensionContext | null = null;
 
 function emptyUsage(): Usage {
@@ -242,6 +269,65 @@ async function createRunDebugDir(): Promise<string> {
 	const dir = path.join(GLOBAL_RUNS_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`);
 	await mkdir(dir, { recursive: true });
 	return dir;
+}
+
+function historyLogPath(run: { debugDir: string }): string {
+	return path.join(run.debugDir, "experiments.jsonl");
+}
+
+function toPersistedRunSnapshot(run: ActiveRun): PersistedRunSnapshot {
+	return {
+		goal: run.goal,
+		criteria: run.criteria,
+		filledPrompt: run.filledPrompt,
+		cwd: run.cwd,
+		modelConfig: run.modelConfig,
+		thinkingLevel: run.thinkingLevel,
+		startedAt: run.startedAt,
+		attempt: run.attempt,
+		attemptStartedAt: run.attemptStartedAt,
+		state: run.state,
+		lastActivityAt: run.lastActivityAt,
+		lastEvent: run.lastEvent,
+		history: run.history,
+		dashboardExpanded: run.dashboardExpanded,
+		stopRequested: run.stopRequested,
+		stopReason: run.stopReason,
+		agentName: run.agentName,
+		debugDir: run.debugDir,
+		lastWorkerSummary: run.lastWorkerSummary,
+		lastFailureReason: run.lastFailureReason,
+		lastVerifierSummary: run.lastVerifierSummary,
+		archivedAt: Date.now(),
+	};
+}
+
+function cloneArchivedRun(snapshot: PersistedRunSnapshot): ActiveRun {
+	return {
+		...snapshot,
+		history: snapshot.history.map((item) => ({ ...item, nextActions: [...item.nextActions] })),
+		currentAbort: undefined,
+		statusTimer: undefined,
+	};
+}
+
+async function persistRunSnapshot(run: ActiveRun): Promise<void> {
+	await mkdir(GLOBAL_EXTENSION_DIR, { recursive: true });
+	await writeFile(GLOBAL_LATEST_RUN_PATH, `${JSON.stringify(toPersistedRunSnapshot(run), null, 2)}\n`, "utf8");
+}
+
+async function appendAttemptRecord(run: ActiveRun, attempt: AttemptRecord): Promise<void> {
+	await writeFile(historyLogPath(run), `${JSON.stringify(attempt)}\n`, { encoding: "utf8", flag: "a" });
+}
+
+async function restoreLatestArchivedRun(): Promise<ActiveRun | null> {
+	if (!(await pathExists(GLOBAL_LATEST_RUN_PATH))) return null;
+	try {
+		const parsed = JSON.parse(await readFile(GLOBAL_LATEST_RUN_PATH, "utf8")) as PersistedRunSnapshot;
+		return cloneArchivedRun(parsed);
+	} catch {
+		return null;
+	}
 }
 
 function normalizeConfiguredTarget(raw: unknown): GoalDrivenModelTarget | undefined {
@@ -541,13 +627,13 @@ function buildVerifierTask(run: ActiveRun, workerSummary: string, reason: string
 function attemptStatusLabel(status: AttemptStatus): string {
 	switch (status) {
 		case "success":
-			return "success";
+			return "met";
 		case "inactive":
 			return "inactive";
 		case "worker_failed":
-			return "worker failed";
+			return "failed";
 		default:
-			return "not met";
+			return "retry";
 	}
 }
 
@@ -568,23 +654,60 @@ function hasInFlightAttempt(run: ActiveRun): boolean {
 	return run.attempt > run.history.length && !run.stopRequested;
 }
 
-function getAttemptCounts(run: ActiveRun): { started: number; completed: number; successes: number; failures: number } {
-	const completed = run.history.length;
-	const successes = run.history.filter((item) => item.status === "success").length;
+function getAttemptCounts(run: ActiveRun): {
+	started: number;
+	met: number;
+	retry: number;
+	failed: number;
+	inactive: number;
+} {
+	const met = run.history.filter((item) => item.status === "success").length;
+	const retry = run.history.filter((item) => item.status === "not_met").length;
+	const failed = run.history.filter((item) => item.status === "worker_failed").length;
+	const inactive = run.history.filter((item) => item.status === "inactive").length;
 	return {
 		started: run.attempt,
-		completed,
-		successes,
-		failures: completed - successes,
+		met,
+		retry,
+		failed,
+		inactive,
 	};
 }
 
+function extractSectionBullets(text: string, section: "SUMMARY" | "OPEN_ISSUES"): string[] {
+	const match = text.match(new RegExp(`${section}:([\\s\\S]*?)(?:\\n[A-Z_]+:|$)`));
+	if (!match) return [];
+	return match[1]
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.startsWith("- "))
+		.map((line) => line.slice(2).trim())
+		.filter((line) => line.length > 0 && line !== "none");
+}
+
+function firstMeaningfulLine(text: string): string | undefined {
+	for (const rawLine of text.split("\n")) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (line === "GOAL_DRIVEN_STATUS: READY_FOR_VERIFICATION") continue;
+		if (line === "SUMMARY:" || line === "OPEN_ISSUES:") continue;
+		if (line.startsWith("```")) continue;
+		if (line.startsWith("- ")) return line.slice(2).trim();
+		return line;
+	}
+	return undefined;
+}
+
 function summarizeAttempt(status: AttemptStatus, verification: VerificationResult, reason: string, workerSummary: string): string {
-	if (status === "success") return singleLine(verification.summary, 220);
-	if (status === "worker_failed") return singleLine(`${reason}. ${workerSummary}`, 220);
-	if (status === "inactive") return singleLine(`${reason}. ${verification.summary}`, 220);
+	const summaryBullets = extractSectionBullets(workerSummary, "SUMMARY");
+	const issueBullets = extractSectionBullets(workerSummary, "OPEN_ISSUES");
+	const workerDescription = summaryBullets[0] ?? issueBullets[0] ?? firstMeaningfulLine(workerSummary);
+	if (status === "success") return singleLine(workerDescription ?? verification.summary, 220);
+	if (status === "worker_failed") return singleLine(workerDescription ?? reason, 220);
+	if (status === "inactive") return singleLine(workerDescription ?? verification.summary ?? reason, 220);
 	const nextAction = verification.nextActions[0];
-	return singleLine(nextAction ? `${verification.summary}. Next: ${nextAction}` : verification.summary, 220);
+	if (workerDescription && nextAction) return singleLine(`${workerDescription} → ${nextAction}`, 220);
+	return singleLine(workerDescription ?? nextAction ?? verification.summary ?? reason, 220);
 }
 
 function padCell(text: string, width: number): string {
@@ -592,68 +715,123 @@ function padCell(text: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
-function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): string[] {
-	const counts = getAttemptCounts(run);
-	const phase = currentPhaseLabel(run);
-	const elapsed = formatElapsed(Date.now() - run.attemptStartedAt);
-	const headline = truncateToWidth(
-		`${theme.fg("accent", "🎯 goal-driven")} ${theme.fg("muted", `${counts.started} experiments`)} ${theme.fg("success", `${counts.successes} success`)} ${theme.fg(counts.failures > 0 ? "warning" : "muted", `${counts.failures} failure`)} ${theme.fg("dim", "│")} ${theme.fg("warning", `#${run.attempt} ${phase} ${elapsed}`)}`,
-		width,
-		"…",
-		true,
-	);
-	const activity = truncateToWidth(
-		`${theme.fg("muted", "activity:")} ${run.lastEvent}`,
-		width,
-		"…",
-		true,
-	);
-	return [headline, activity];
+function appendRightAlignedAdaptiveHint(left: string, width: number, theme: Theme, hints: string[]): string {
+	for (const candidate of hints) {
+		const hint = theme.fg("dim", candidate);
+		const leftWidth = visibleWidth(left);
+		const hintWidth = visibleWidth(hint);
+		if (leftWidth + hintWidth <= width) {
+			return left + " ".repeat(Math.max(0, width - leftWidth - hintWidth)) + hint;
+		}
+		const availableLeftWidth = Math.max(0, width - hintWidth);
+		const truncatedLeft = truncateToWidth(left, availableLeftWidth, "…", true);
+		const truncatedLeftWidth = visibleWidth(truncatedLeft);
+		if (truncatedLeftWidth + hintWidth <= width) {
+			return truncatedLeft + " ".repeat(Math.max(0, width - truncatedLeftWidth - hintWidth)) + hint;
+		}
+	}
+	return truncateToWidth(left, width, "…", true);
 }
 
-function renderDashboardLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+function runTitle(run: ActiveRun): string {
+	return `🔬 goal-driven: ${run.goal}`;
+}
+
+function liveSummary(run: ActiveRun): string {
+	if (run.state === "verifying") return run.lastVerifierSummary ?? run.lastEvent;
+	return run.lastEvent;
+}
+
+function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): string[] {
 	const counts = getAttemptCounts(run);
-	const lines = [
-		truncateToWidth(`${theme.fg("accent", "🎯 Goal-Driven")} ${theme.fg("muted", singleLine(run.goal, Math.max(20, width - 16)))}`, width, "…", true),
+	const left = [
+		theme.fg("accent", "🔬 goal-driven"),
+		theme.fg("muted", ` ${counts.started} runs`),
+		theme.fg("success", ` ${counts.met} met`),
+		counts.retry > 0 ? theme.fg("warning", ` ${counts.retry} retry`) : "",
+		counts.failed > 0 ? theme.fg("error", ` ${counts.failed} failed`) : "",
+		counts.inactive > 0 ? theme.fg("warning", ` ${counts.inactive} inactive`) : "",
+		theme.fg("dim", " │ "),
+		theme.fg("warning", theme.bold(`★ active: #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)),
+		theme.fg("dim", " │ "),
+		theme.fg("muted", singleLine(liveSummary(run), 120)),
+	].join("");
+	return [
+		appendRightAlignedAdaptiveHint(left, width, theme, [
+			"ctrl+x expand • ctrl+shift+x fullscreen",
+			"ctrl+x expand • full: c-s-x",
+			"ctrl+x • c-s-x",
+		]),
+	];
+}
+
+function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+	const counts = getAttemptCounts(run);
+	const lines: string[] = [];
+	lines.push(
 		truncateToWidth(
-			`${theme.fg("muted", "Experiments:")} ${counts.started}  ${theme.fg("success", `${counts.successes} success`)}  ${theme.fg(counts.failures > 0 ? "warning" : "muted", `${counts.failures} failure`)}  ${theme.fg("warning", `active #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)}`,
+			`  ${theme.fg("muted", "Runs:")} ${theme.fg("text", String(counts.started))}` +
+				`  ${theme.fg("success", `${counts.met} met`)}` +
+				(counts.retry > 0 ? `  ${theme.fg("warning", `${counts.retry} retry`)}` : "") +
+				(counts.failed > 0 ? `  ${theme.fg("error", `${counts.failed} failed`)}` : "") +
+				(counts.inactive > 0 ? `  ${theme.fg("warning", `${counts.inactive} inactive`)}` : ""),
 			width,
 			"…",
 			true,
 		),
-		truncateToWidth(`${theme.fg("muted", "Criteria:")} ${singleLine(run.criteria, 220)}`, width, "…", true),
-		truncateToWidth(`${theme.fg("muted", "Activity:")} ${run.lastEvent}`, width, "…", true),
-		truncateToWidth(`${theme.fg("muted", "Logs:")} ${run.debugDir}`, width, "…", true),
-		"",
-	];
-
-	if (headerHint) {
-		lines.push(truncateToWidth(theme.fg("dim", headerHint), width, "…", true));
-	}
+	);
+	lines.push(
+		truncateToWidth(
+			`  ${theme.fg("muted", "Active:")} ${theme.fg("warning", `★ #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)}`,
+			width,
+			"…",
+			true,
+		),
+	);
+	lines.push(
+		truncateToWidth(
+			`  ${theme.fg("muted", "Live:")} ${theme.fg("text", singleLine(liveSummary(run), 220))}`,
+			width,
+			"…",
+			true,
+		),
+	);
+	lines.push(
+		truncateToWidth(
+			`  ${theme.fg("muted", "Criteria:")} ${theme.fg("muted", singleLine(run.criteria, 220))}`,
+			width,
+			"…",
+			true,
+		),
+	);
+	lines.push("");
 
 	const idxWidth = 4;
 	const durWidth = 9;
-	const resultWidth = 14;
-	const summaryWidth = Math.max(20, width - idxWidth - durWidth - resultWidth - 4);
+	const resultWidth = 12;
+	const summaryWidth = Math.max(20, width - idxWidth - durWidth - resultWidth - 6);
+	const headerLine =
+		`  ${theme.fg("muted", padCell("#", idxWidth))}` +
+		`${theme.fg("muted", padCell("duration", durWidth))}` +
+		`${theme.fg("muted", padCell("result", resultWidth))}` +
+		`${theme.fg("muted", "description")}`;
 	lines.push(
-		truncateToWidth(
-			`${theme.fg("muted", padCell("#", idxWidth))}${theme.fg("muted", padCell("duration", durWidth))}${theme.fg("muted", padCell("result", resultWidth))}${theme.fg("muted", "summary")}`,
-			width,
-			"…",
-			true,
-		),
+		headerHint
+			? appendRightAlignedAdaptiveHint(headerLine, width, theme, [headerHint, "ctrl+x • c-s-x"])
+			: truncateToWidth(headerLine, width, "…", true),
 	);
-	lines.push(truncateToWidth(theme.fg("borderMuted", "─".repeat(Math.max(0, width - 2))), width, "…", true));
+	lines.push(truncateToWidth(`  ${theme.fg("borderMuted", "─".repeat(Math.max(0, width - 4)))}`, width, "…", true));
 
-	const start = Math.max(0, run.history.length - maxRows);
+	const effectiveMax = maxRows <= 0 ? run.history.length : maxRows;
+	const start = Math.max(0, run.history.length - effectiveMax);
 	if (start > 0) {
-		lines.push(truncateToWidth(theme.fg("dim", `… ${start} earlier experiments`), width, "…", true));
+		lines.push(truncateToWidth(`  ${theme.fg("dim", `… ${start} earlier experiment${start === 1 ? "" : "s"}`)}`, width, "…", true));
 	}
 
 	for (const item of run.history.slice(start)) {
 		const duration = formatElapsed(item.finishedAt - item.startedAt);
 		const row =
-			`${theme.fg("dim", padCell(String(item.attempt), idxWidth))}` +
+			`  ${theme.fg("dim", padCell(String(item.attempt), idxWidth))}` +
 			`${theme.fg("text", padCell(duration, durWidth))}` +
 			`${padCell(attemptStatusColor(theme, item.status), resultWidth)}` +
 			`${theme.fg("muted", truncateToWidth(item.summary, summaryWidth, "…", true))}`;
@@ -662,18 +840,31 @@ function renderDashboardLines(run: ActiveRun, theme: Theme, width: number, maxRo
 
 	if (hasInFlightAttempt(run)) {
 		const spinner = OVERLAY_SPINNER[Math.floor(Date.now() / 120) % OVERLAY_SPINNER.length] ?? "•";
-		const activeSummary = run.state === "verifying"
-			? run.lastVerifierSummary ?? run.lastEvent
-			: run.lastEvent;
 		const row =
-			`${theme.fg("dim", padCell(String(run.attempt), idxWidth))}` +
+			`  ${theme.fg("dim", padCell(String(run.attempt), idxWidth))}` +
 			`${theme.fg("warning", padCell(formatElapsed(Date.now() - run.attemptStartedAt), durWidth))}` +
 			`${padCell(theme.fg("warning", `${spinner} ${currentPhaseLabel(run)}`), resultWidth)}` +
-			`${theme.fg("text", truncateToWidth(singleLine(activeSummary, 220), summaryWidth, "…", true))}`;
+			`${theme.fg("text", truncateToWidth(singleLine(liveSummary(run), 220), summaryWidth, "…", true))}`;
 		lines.push(truncateToWidth(row, width, "…", true));
 	}
 
 	return lines;
+}
+
+function renderExpandedWidgetLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+	const title = truncateToWidth(runTitle(run), Math.max(0, width - 8), "…", true);
+	const fillLen = Math.max(0, width - 3 - 1 - visibleWidth(title) - 1);
+	return [
+		truncateToWidth(
+			theme.fg("borderMuted", "───") +
+				theme.fg("accent", ` ${title} `) +
+				theme.fg("borderMuted", "─".repeat(fillLen)),
+			width,
+			"…",
+			true,
+		),
+		...renderDashboardBodyLines(run, theme, width, maxRows, headerHint),
+	];
 }
 
 function buildStatusLines(run: ActiveRun): string[] {
@@ -684,7 +875,7 @@ function buildStatusLines(run: ActiveRun): string[] {
 		`Model: ${run.modelConfig.primary ?? "inherit current Pi model"}${run.modelConfig.exactTarget ? " (exact)" : ""}`,
 		`Goal: ${singleLine(run.goal, 120)}`,
 		`Criteria: ${singleLine(run.criteria, 120)}`,
-		`Experiments: ${counts.started} started, ${counts.successes} success, ${counts.failures} failure`,
+		`Experiments: ${counts.started} started, ${counts.met} met, ${counts.retry} retry, ${counts.failed} failed, ${counts.inactive} inactive`,
 		`Current attempt: #${run.attempt} ${currentPhaseLabel(run)} (${formatElapsed(Date.now() - run.attemptStartedAt)})`,
 		`Last activity: ${formatDuration(Date.now() - run.lastActivityAt)}`,
 		`Last event: ${singleLine(run.lastEvent, 120)}`,
@@ -698,6 +889,10 @@ function buildStatusLines(run: ActiveRun): string[] {
 	}
 
 	return lines;
+}
+
+function getDisplayRun(): ActiveRun | null {
+	return activeRun ?? latestArchivedRun;
 }
 
 function clearUiStatus(): void {
@@ -716,16 +911,16 @@ function refreshUiStatus(): void {
 	const run = activeRun;
 	const counts = getAttemptCounts(run);
 	const label = run.state === "running"
-		? `🎯 ${counts.started} exp`
+		? `🔬 ${counts.started} runs`
 		: run.state === "verifying"
-			? `🔎 verify #${run.attempt}`
+			? `🔎 #${run.attempt} verifying`
 			: "⏹ stopping";
 	latestCtx.ui.setStatus(COMMAND_NAME, label);
 	latestCtx.ui.setWidget(COMMAND_NAME, (tui, theme) => ({
 		render(width: number): string[] {
 			const safeWidth = Math.max(1, width || getTuiSize(tui).width);
 			return run.dashboardExpanded
-				? renderDashboardLines(run, theme, safeWidth, DASHBOARD_MAX_ROWS, "ctrl+x collapse • ctrl+shift+x fullscreen")
+				? renderExpandedWidgetLines(run, theme, safeWidth, safeWidth < 95 ? 4 : DASHBOARD_MAX_ROWS, "ctrl+x collapse • ctrl+shift+x fullscreen")
 				: renderCompactWidgetLines(run, theme, safeWidth);
 		},
 		invalidate(): void {},
@@ -740,6 +935,8 @@ function finalizeRun(run: ActiveRun | null, message?: string, level: "info" | "w
 	if (!run) return;
 	if (run.statusTimer) clearInterval(run.statusTimer);
 	if (run.currentAbort) run.currentAbort.abort();
+	latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
+	void persistRunSnapshot(run);
 	if (activeRun === run) activeRun = null;
 	clearUiStatus();
 	if (message) notify(message, level);
@@ -899,7 +1096,7 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 					? "not_met"
 					: "worker_failed";
 		const attemptSummary = summarizeAttempt(attemptStatus, verification, reason, workerSummary);
-		run.history.push({
+		const attemptRecord: AttemptRecord = {
 			attempt: run.attempt,
 			status: attemptStatus,
 			reason,
@@ -915,7 +1112,11 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 			verdict: verification.verdict,
 			startedAt: attemptStartedAt,
 			finishedAt: Date.now(),
-		});
+		};
+		run.history.push(attemptRecord);
+		latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
+		await appendAttemptRecord(run, attemptRecord);
+		await persistRunSnapshot(run);
 
 		if (verification.verdict === "MET") {
 			finalizeRun(run, `Goal-Driven succeeded: ${verification.summary}`, "info");
@@ -935,8 +1136,10 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 }
 
 function getStatusText(): string {
-	if (!activeRun) return "No Goal-Driven run is active.";
-	return buildStatusLines(activeRun).join("\n");
+	const run = getDisplayRun();
+	if (!run) return "No Goal-Driven run is active.";
+	const prefix = activeRun ? "Active run" : "Last archived run";
+	return `${prefix}\n${buildStatusLines(run).join("\n")}`;
 }
 
 async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string): Promise<SetupResult | null> {
@@ -955,6 +1158,7 @@ async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string):
 export default function goalDriven(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		latestArchivedRun = await restoreLatestArchivedRun();
 		refreshUiStatus();
 	});
 
@@ -1079,6 +1283,8 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				debugDir: await createRunDebugDir(),
 			};
 			activeRun = run;
+			latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
+			await persistRunSnapshot(run);
 
 			void supervise(run, selectedAgent.agent).catch((error: unknown) => {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1091,12 +1297,14 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		description: "Toggle Goal-Driven experiment dashboard",
 		handler: async (ctx) => {
 			latestCtx = ctx;
-			if (!activeRun) {
+			const run = getDisplayRun();
+			if (!run) {
 				ctx.ui.notify("No Goal-Driven run is active.", "info");
 				return;
 			}
-			activeRun.dashboardExpanded = !activeRun.dashboardExpanded;
-			refreshUiStatus();
+			run.dashboardExpanded = !run.dashboardExpanded;
+			if (activeRun) refreshUiStatus();
+			else ctx.ui.notify(getStatusText(), "info");
 		},
 	});
 
@@ -1104,7 +1312,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		description: "Open fullscreen Goal-Driven experiment dashboard",
 		handler: async (ctx) => {
 			latestCtx = ctx;
-			const run = activeRun;
+			const run = getDisplayRun();
 			if (!run) {
 				ctx.ui.notify("No Goal-Driven run is active.", "info");
 				return;
@@ -1121,7 +1329,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 						render(width: number): string[] {
 							const safeWidth = Math.max(1, width || getTuiSize(tui).width);
 							const viewportRows = Math.max(8, getTuiSize(tui).height - 4);
-							const content = renderDashboardLines(run, theme, safeWidth, Math.max(run.history.length + 1, DASHBOARD_MAX_ROWS), "↑↓/j/k scroll • pgup/pgdn • g/G • esc close");
+							const content = renderExpandedWidgetLines(run, theme, safeWidth, 0);
 							lastTotalRows = content.length;
 							lastViewportRows = viewportRows;
 							const maxScroll = Math.max(0, lastTotalRows - viewportRows);
@@ -1129,10 +1337,21 @@ export default function goalDriven(pi: ExtensionAPI): void {
 							const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
 							const lines = [...visible];
 							while (lines.length < viewportRows) lines.push("");
-							const footer = lastTotalRows > viewportRows
+							const scrollInfo = lastTotalRows > viewportRows
 								? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, lastTotalRows)}/${lastTotalRows}`
 								: "";
-							lines.push(truncateToWidth(theme.fg("dim", `esc close • ctrl+x inline${footer}`), safeWidth, "…", true));
+							const helpText = safeWidth >= 85
+								? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
+								: ` j/k scroll • esc close${scrollInfo} `;
+							const footFill = Math.max(0, safeWidth - visibleWidth(helpText));
+							lines.push(
+								truncateToWidth(
+									theme.fg("borderMuted", "─".repeat(footFill)) + theme.fg("dim", helpText),
+									safeWidth,
+									"…",
+									true,
+								),
+							);
 							return lines;
 						},
 						handleInput(data: string): void {

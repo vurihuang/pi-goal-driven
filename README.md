@@ -67,11 +67,12 @@ When a config target is set, Goal-Driven does not append the current Pi thinking
 
 While the loop is running, every worker cycle is shown as an **experiment** in the UI:
 
-- compact widget above the editor with live activity
-- counts for experiments, success, and failure
-- per-experiment duration and summary
+- compact widget above the editor in an autoresearch-style single-line format
+- counts for runs, met, retry, failed, and inactive experiments
+- per-experiment duration and description-like summaries
 - `Ctrl+X` toggles the inline experiment dashboard
 - `Ctrl+Shift+X` opens a fullscreen scrollable dashboard
+- the latest run snapshot is persisted, so you can still inspect the experiment history after restarting Pi
 
 ### `/goal-driven setup`
 
