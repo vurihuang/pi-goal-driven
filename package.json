@@ -1,0 +1,43 @@
+{
+  "name": "pi-goal-driven",
+  "version": "0.1.0",
+  "description": "Goal-Driven master/subagent supervisor for pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "goal-driven",
+    "subagent",
+    "extension"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "config.json",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.67.2",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "pi-subagents": "^0.14.1"
+  }
+}
