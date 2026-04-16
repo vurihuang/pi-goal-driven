@@ -14,7 +14,7 @@ const COMMAND_NAME = "goal-driven";
 const DEFAULT_AGENT_NAME = "worker";
 const INACTIVITY_CHECK_MS = 30_000;
 const INACTIVITY_WINDOW_MS = 5 * 60_000;
-const STATUS_REFRESH_MS = 15_000;
+const STATUS_REFRESH_MS = 1_000;
 const HISTORY_LIMIT = 3;
 const DASHBOARD_MAX_ROWS = 6;
 const SNIPPET_LIMIT = 1_800;
@@ -30,7 +30,6 @@ const GLOBAL_RUNS_DIR = path.join(GLOBAL_EXTENSION_DIR, "runs");
 const GLOBAL_LATEST_RUN_PATH = path.join(GLOBAL_EXTENSION_DIR, "latest-run.json");
 const GLOBAL_SETTINGS_PATH = path.join(GLOBAL_AGENT_DIR, "settings.json");
 const GLOBAL_SUBAGENTS_EXTENSION_PATH = path.join(GLOBAL_AGENT_DIR, "extensions", "pi-subagents", "index.ts");
-const PROJECT_CONFIG_CANDIDATES = [".pi-goal-driven.json", path.join(".pi", "pi-goal-driven.json")] as const;
 
 const PROMPT_TEMPLATE = `# Goal-Driven(1 master agent + 1 subagent) System
 
@@ -110,14 +109,10 @@ type ProgressUpdate = {
 	details?: Details;
 };
 
-interface GoalDrivenModelTarget {
-	provider: string;
-	model: string;
-}
-
 interface GoalDrivenConfig {
 	defaultAgent: string;
-	target?: GoalDrivenModelTarget;
+	provider?: string;
+	model?: string;
 }
 
 interface RunModelConfig {
@@ -330,14 +325,6 @@ async function restoreLatestArchivedRun(): Promise<ActiveRun | null> {
 	}
 }
 
-function normalizeConfiguredTarget(raw: unknown): GoalDrivenModelTarget | undefined {
-	if (!isRecord(raw)) return undefined;
-	const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
-	const model = typeof raw.model === "string" ? raw.model.trim() : "";
-	if (!provider || !model) return undefined;
-	return { provider, model };
-}
-
 function normalizeConfig(raw: unknown): GoalDrivenConfig {
 	if (!isRecord(raw)) return { ...DEFAULT_CONFIG };
 	const defaultAgent = typeof raw.defaultAgent === "string"
@@ -345,13 +332,12 @@ function normalizeConfig(raw: unknown): GoalDrivenConfig {
 		: typeof raw.agent === "string"
 			? raw.agent.trim()
 			: "";
-	const directTarget = normalizeConfiguredTarget(raw.target);
-	const firstTarget = Array.isArray(raw.targets) ? normalizeConfiguredTarget(raw.targets[0]) : undefined;
-	const flatTarget = normalizeConfiguredTarget(raw);
-	const target = directTarget ?? firstTarget ?? flatTarget;
+	const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+	const model = typeof raw.model === "string" ? raw.model.trim() : "";
 	return {
 		defaultAgent: defaultAgent || DEFAULT_AGENT_NAME,
-		...(target ? { target } : {}),
+		...(provider ? { provider } : {}),
+		...(model ? { model } : {}),
 	};
 }
 
@@ -360,11 +346,7 @@ async function ensureBundledConfigFile(): Promise<void> {
 	await writeFile(BUNDLED_CONFIG_PATH, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, "utf8");
 }
 
-async function resolveConfigPath(cwd: string): Promise<string> {
-	for (const relativePath of PROJECT_CONFIG_CANDIDATES) {
-		const candidatePath = path.join(cwd, relativePath);
-		if (await pathExists(candidatePath)) return candidatePath;
-	}
+async function resolveConfigPath(_cwd: string): Promise<string> {
 	if (await pathExists(GLOBAL_CONFIG_PATH)) return GLOBAL_CONFIG_PATH;
 	return BUNDLED_CONFIG_PATH;
 }
@@ -423,10 +405,25 @@ function selectConfiguredAgent(
 	return { agent: fallbackAgent, requestedName: configuredName, fallbackUsed: true };
 }
 
+function canonicalizeGoalDrivenModelId(modelId: string): string {
+	const normalized = modelId.trim();
+	if (!normalized) return normalized;
+	if (/^gpt-5\.\d+(?:[.-][A-Za-z0-9]+)*$/i.test(normalized)) {
+		return normalized.replace(/\./g, "-");
+	}
+	return normalized;
+}
+
 function buildModelRefs(provider: string | undefined, modelId: string | undefined): string[] {
 	if (!provider || !modelId) return [];
+	const normalizedModelId = modelId.trim();
 	const variants = new Set<string>();
-	for (const candidate of [modelId, modelId.replace(/\./g, "-"), modelId.replace(/-/g, ".")]) {
+	for (const candidate of [
+		canonicalizeGoalDrivenModelId(normalizedModelId),
+		normalizedModelId,
+		normalizedModelId.replace(/\./g, "-"),
+		normalizedModelId.replace(/-/g, "."),
+	]) {
 		const normalized = candidate.trim();
 		if (normalized) variants.add(`${provider}/${normalized}`);
 	}
@@ -434,13 +431,14 @@ function buildModelRefs(provider: string | undefined, modelId: string | undefine
 }
 
 function buildRunModelConfig(ctx: ExtensionContext, config: GoalDrivenConfig): RunModelConfig {
-	const refs = config.target
-		? buildModelRefs(config.target.provider, config.target.model)
+	const hasConfiguredModel = Boolean(config.provider && config.model);
+	const refs = hasConfiguredModel
+		? buildModelRefs(config.provider, config.model)
 		: buildModelRefs(ctx.model?.provider, ctx.model?.id);
 	return {
 		primary: refs[0],
 		fallbacks: refs.slice(1),
-		exactTarget: Boolean(config.target),
+		exactTarget: hasConfiguredModel,
 	};
 }
 
@@ -742,6 +740,15 @@ function liveSummary(run: ActiveRun): string {
 	return run.lastEvent;
 }
 
+function currentAttemptElapsedMs(run: ActiveRun): number {
+	if (activeRun === run && hasInFlightAttempt(run) && !run.stopRequested) {
+		return Math.max(0, Date.now() - run.attemptStartedAt);
+	}
+	const completedAttempt = [...run.history].reverse().find((item) => item.attempt === run.attempt);
+	if (completedAttempt) return Math.max(0, completedAttempt.finishedAt - completedAttempt.startedAt);
+	return Math.max(0, run.lastActivityAt - run.attemptStartedAt);
+}
+
 function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): string[] {
 	const counts = getAttemptCounts(run);
 	const left = [
@@ -752,7 +759,7 @@ function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): 
 		counts.failed > 0 ? theme.fg("error", ` ${counts.failed} failed`) : "",
 		counts.inactive > 0 ? theme.fg("warning", ` ${counts.inactive} inactive`) : "",
 		theme.fg("dim", " │ "),
-		theme.fg("warning", theme.bold(`★ active: #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)),
+		theme.fg("warning", theme.bold(`★ active: #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(currentAttemptElapsedMs(run))}`)),
 		theme.fg("dim", " │ "),
 		theme.fg("muted", singleLine(liveSummary(run), 120)),
 	].join("");
@@ -782,7 +789,7 @@ function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, m
 	);
 	lines.push(
 		truncateToWidth(
-			`  ${theme.fg("muted", "Active:")} ${theme.fg("warning", `★ #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(Date.now() - run.attemptStartedAt)}`)}`,
+			`  ${theme.fg("muted", "Active:")} ${theme.fg("warning", `★ #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(currentAttemptElapsedMs(run))}`)}`,
 			width,
 			"…",
 			true,
@@ -842,7 +849,7 @@ function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, m
 		const spinner = OVERLAY_SPINNER[Math.floor(Date.now() / 120) % OVERLAY_SPINNER.length] ?? "•";
 		const row =
 			`  ${theme.fg("dim", padCell(String(run.attempt), idxWidth))}` +
-			`${theme.fg("warning", padCell(formatElapsed(Date.now() - run.attemptStartedAt), durWidth))}` +
+			`${theme.fg("warning", padCell(formatElapsed(currentAttemptElapsedMs(run)), durWidth))}` +
 			`${padCell(theme.fg("warning", `${spinner} ${currentPhaseLabel(run)}`), resultWidth)}` +
 			`${theme.fg("text", truncateToWidth(singleLine(liveSummary(run), 220), summaryWidth, "…", true))}`;
 		lines.push(truncateToWidth(row, width, "…", true));
@@ -872,11 +879,11 @@ function buildStatusLines(run: ActiveRun): string[] {
 	const lines = [
 		`🎯 Goal-Driven (${run.state})`,
 		`Subagent profile: ${run.agentName}`,
-		`Model: ${run.modelConfig.primary ?? "inherit current Pi model"}${run.modelConfig.exactTarget ? " (exact)" : ""}`,
+		`Model: ${run.modelConfig.primary ?? "inherit current Pi model"}${run.modelConfig.exactTarget ? " (configured)" : ""}`,
 		`Goal: ${singleLine(run.goal, 120)}`,
 		`Criteria: ${singleLine(run.criteria, 120)}`,
 		`Experiments: ${counts.started} started, ${counts.met} met, ${counts.retry} retry, ${counts.failed} failed, ${counts.inactive} inactive`,
-		`Current attempt: #${run.attempt} ${currentPhaseLabel(run)} (${formatElapsed(Date.now() - run.attemptStartedAt)})`,
+		`Current attempt: #${run.attempt} ${currentPhaseLabel(run)} (${formatElapsed(currentAttemptElapsedMs(run))})`,
 		`Last activity: ${formatDuration(Date.now() - run.lastActivityAt)}`,
 		`Last event: ${singleLine(run.lastEvent, 120)}`,
 		`Logs: ${run.debugDir}`,
@@ -1244,7 +1251,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			}
 
 			const { config, path: configPath } = await loadGoalDrivenConfig(ctx);
-			if (!ctx.model && !config.target) {
+			if (!ctx.model && !(config.provider && config.model)) {
 				ctx.ui.notify("Select a model before starting Goal-Driven, or configure provider/model in pi-goal-driven config.", "error");
 				return;
 			}
