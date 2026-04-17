@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AssistantMessage } from "@mariozechner/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { discoverAgents, type AgentConfig } from "pi-subagents/agents.ts";
@@ -11,6 +13,7 @@ import { getSingleResultOutput } from "pi-subagents/utils.ts";
 
 const EXTENSION_NAME = "pi-goal-driven";
 const COMMAND_NAME = "goal-driven";
+const BRAINSTORM_COMMAND_NAME = `${COMMAND_NAME}:brainstorm`;
 const DEFAULT_AGENT_NAME = "worker";
 const INACTIVITY_CHECK_MS = 30_000;
 const INACTIVITY_WINDOW_MS = 5 * 60_000;
@@ -27,6 +30,7 @@ const GLOBAL_AGENT_DIR = getAgentDir();
 const GLOBAL_EXTENSION_DIR = path.join(GLOBAL_AGENT_DIR, "extensions", EXTENSION_NAME);
 const GLOBAL_CONFIG_PATH = path.join(GLOBAL_EXTENSION_DIR, "config.json");
 const GLOBAL_RUNS_DIR = path.join(GLOBAL_EXTENSION_DIR, "runs");
+const GLOBAL_BRAINSTORMS_DIR = path.join(GLOBAL_EXTENSION_DIR, "brainstorms");
 const GLOBAL_SETTINGS_PATH = path.join(GLOBAL_AGENT_DIR, "settings.json");
 const GLOBAL_SUBAGENTS_EXTENSION_PATH = path.join(GLOBAL_AGENT_DIR, "extensions", "pi-subagents", "index.ts");
 
@@ -34,9 +38,9 @@ const PROMPT_TEMPLATE = `# Goal-Driven(1 master agent + 1 subagent) System
 
 Here we define a goal-driven multi-agent system for solving any problem.
 
-Goal: [[[[[在此定义你的目标]]]]]
+Goal: [[[[[DEFINE_GOAL_HERE]]]]]
 
-Criteria for success: [[[[[在此定义你的成功标准]]]]]
+Criteria for success: [[[[[DEFINE_SUCCESS_CRITERIA_HERE]]]]]
 
 Here is the System: The system contains a master agent and a subagent. You are the master agent, and you need to create 1 subagent to help you complete the task.
 
@@ -99,6 +103,32 @@ Rules:
 - JSON schema:
 {"verdict":"MET"|"NOT_MET","summary":"short explanation","nextActions":["action 1","action 2"]}`;
 
+const GOAL_DRIVEN_BRAINSTORM_SYSTEM_PROMPT = `You are in Goal-Driven brainstorm mode.
+
+Your job is to convert the user's abstract task into a high-quality Goal and Criteria for success for the /goal-driven workflow.
+
+Behavior:
+- Think like a concise ce:brainstorm facilitator.
+- Understand the request, inspect the repo when useful, and pressure-test scope lightly.
+- Ask at most one focused question at a time, and only when it materially improves the final Goal or Criteria.
+- If the task is already clear, skip extra questions and draft the Goal and Criteria immediately.
+- Do not implement code during this mode.
+- Keep implementation details out unless the task itself is architectural.
+- Use repo-relative paths when referencing files.
+- Keep responses concise.
+
+Drafting rules:
+- Produce a Goal that is narrow enough to execute well, but broad enough to capture the real user intent.
+- Produce Criteria for success that are observable, strict, and directly usable by a verifier.
+- Include verification commands when appropriate for the repo and task.
+- Prefer numbered criteria.
+
+Confirmation and handoff:
+- Before finalizing, show the proposed Goal and Criteria in normal prose and ask the user for explicit confirmation.
+- Use a short confirmation prompt such as: "If this looks right, reply 'ok' and I'll start Goal-Driven with it."
+- Never emit the final machine-readable block or any JSON protocol block to the user.
+- The user-facing confirmation response should stay human-readable only.`;
+
 type RunState = "running" | "verifying" | "stopping";
 type Verdict = "MET" | "NOT_MET";
 type AttemptStatus = "success" | "not_met" | "worker_failed" | "inactive";
@@ -127,6 +157,7 @@ interface SetupResult {
 	goal: string;
 	criteria: string;
 	agentName: string;
+	brainstormSummary?: string;
 }
 
 interface VerificationResult {
@@ -156,6 +187,7 @@ interface ManagedSingleRun {
 interface PersistedRunSnapshot {
 	goal: string;
 	criteria: string;
+	brainstormSummary?: string;
 	filledPrompt: string;
 	cwd: string;
 	modelConfig: RunModelConfig;
@@ -181,6 +213,7 @@ interface PersistedRunSnapshot {
 interface ActiveRun {
 	goal: string;
 	criteria: string;
+	brainstormSummary?: string;
 	filledPrompt: string;
 	cwd: string;
 	modelConfig: RunModelConfig;
@@ -204,9 +237,36 @@ interface ActiveRun {
 	statusTimer?: NodeJS.Timeout;
 }
 
+interface PreparedRunContext {
+	config: GoalDrivenConfig;
+	configPath: string;
+	selectedAgent: ReturnType<typeof selectConfiguredAgent>;
+}
+
+type BrainstormPhase = "starting" | "researching" | "drafting" | "awaiting-confirmation";
+
+interface BrainstormState {
+	agentName: string;
+	initialRequest: string;
+	startedAt: number;
+	prepared: PreparedRunContext;
+	thinkingLevel: string;
+	phase: BrainstormPhase;
+	lastEvent: string;
+	draftPath: string;
+	latestDraft?: BrainstormResult;
+}
+
+interface BrainstormResult {
+	goal: string;
+	criteria: string;
+	summary?: string;
+}
+
 let activeRun: ActiveRun | null = null;
 let latestArchivedRun: ActiveRun | null = null;
 let latestCtx: ExtensionContext | null = null;
+let activeBrainstorm: BrainstormState | null = null;
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -253,6 +313,10 @@ function getTuiSize(tui: { terminal?: { columns?: number; rows?: number } }): { 
 	};
 }
 
+async function ensureDir(dir: string): Promise<void> {
+	await mkdir(dir, { recursive: true });
+}
+
 function sanitizePathSegment(value: string): string {
 	const sanitized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 	return sanitized || "run";
@@ -264,6 +328,17 @@ function runsDirForCwd(cwd: string): string {
 
 function latestRunSnapshotPathForCwd(cwd: string): string {
 	return path.join(runsDirForCwd(cwd), "latest-run.json");
+}
+
+function brainstormsDirForCwd(cwd: string): string {
+	return path.join(GLOBAL_BRAINSTORMS_DIR, sanitizePathSegment(cwd));
+}
+
+function brainstormDraftPath(cwd: string, startedAt: number): string {
+	return path.join(
+		brainstormsDirForCwd(cwd),
+		`${new Date(startedAt).toISOString().replace(/[:.]/g, "-")}-draft.json`,
+	);
 }
 
 async function createRunDebugDir(cwd: string): Promise<string> {
@@ -283,6 +358,7 @@ function toPersistedRunSnapshot(run: ActiveRun): PersistedRunSnapshot {
 	return {
 		goal: run.goal,
 		criteria: run.criteria,
+		brainstormSummary: run.brainstormSummary,
 		filledPrompt: run.filledPrompt,
 		cwd: run.cwd,
 		modelConfig: run.modelConfig,
@@ -316,8 +392,21 @@ function cloneArchivedRun(snapshot: PersistedRunSnapshot): ActiveRun {
 }
 
 async function persistRunSnapshot(run: ActiveRun): Promise<void> {
-	await mkdir(runsDirForCwd(run.cwd), { recursive: true });
+	await ensureDir(runsDirForCwd(run.cwd));
 	await writeFile(latestRunSnapshotPathForCwd(run.cwd), `${JSON.stringify(toPersistedRunSnapshot(run), null, 2)}\n`, "utf8");
+}
+
+async function persistBrainstormDraft(state: BrainstormState): Promise<void> {
+	await ensureDir(path.dirname(state.draftPath));
+	const content = {
+		startedAt: state.startedAt,
+		agentName: state.agentName,
+		phase: state.phase,
+		lastEvent: state.lastEvent,
+		initialRequest: state.initialRequest,
+		latestDraft: state.latestDraft,
+	};
+	await writeFile(state.draftPath, `${JSON.stringify(content, null, 2)}\n`, "utf8");
 }
 
 async function appendAttemptRecord(run: ActiveRun, attempt: AttemptRecord): Promise<void> {
@@ -434,8 +523,8 @@ function buildRunModelConfig(ctx: ExtensionContext, config: GoalDrivenConfig): R
 }
 
 function fillPromptTemplate(goal: string, criteria: string): string {
-	return PROMPT_TEMPLATE.replace("[[[[[在此定义你的目标]]]]]", goal).replace(
-		"[[[[[在此定义你的成功标准]]]]]",
+	return PROMPT_TEMPLATE.replace("[[[[[DEFINE_GOAL_HERE]]]]]", goal).replace(
+		"[[[[[DEFINE_SUCCESS_CRITERIA_HERE]]]]]",
 		criteria,
 	);
 }
@@ -497,7 +586,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
 function buildWorkerAgent(
 	baseAgent: AgentConfig,
 	thinkingLevel: string,
-	exactTarget: boolean,
+	_exactTarget: boolean,
 ): AgentConfig {
 	return {
 		...baseAgent,
@@ -506,14 +595,14 @@ function buildWorkerAgent(
 		tools: baseAgent.tools,
 		fallbackModels: undefined,
 		systemPrompt: mergeSystemPrompt(baseAgent.systemPrompt, WORKER_SYSTEM_PROMPT),
-		thinking: exactTarget || thinkingLevel === "off" ? undefined : thinkingLevel,
+		thinking: thinkingLevel === "off" ? undefined : thinkingLevel,
 	};
 }
 
 function buildVerifierAgent(
 	baseAgent: AgentConfig,
 	thinkingLevel: string,
-	exactTarget: boolean,
+	_exactTarget: boolean,
 ): AgentConfig {
 	return {
 		name: "goal-driven-verifier",
@@ -522,12 +611,12 @@ function buildVerifierAgent(
 		mcpDirectTools: [],
 		model: baseAgent.model,
 		fallbackModels: undefined,
-		thinking: exactTarget || thinkingLevel === "off" ? undefined : thinkingLevel,
+		thinking: thinkingLevel === "off" ? undefined : thinkingLevel,
 		systemPrompt: VERIFIER_SYSTEM_PROMPT,
 		source: baseAgent.source,
 		filePath: baseAgent.filePath,
 		skills: undefined,
-		extensions: [],
+		extensions: undefined,
 		output: undefined,
 		defaultReads: undefined,
 		defaultProgress: false,
@@ -538,9 +627,50 @@ function buildVerifierAgent(
 	};
 }
 
-function summarizeSingleResult(result: SingleResult): string {
+async function readLatestAssistantTextFromSessionDir(sessionDir: string): Promise<string | undefined> {
+	let files: string[];
+	try {
+		files = (await readdir(sessionDir)).filter((file) => file.endsWith(".jsonl")).sort();
+	} catch {
+		return undefined;
+	}
+	if (files.length === 0) return undefined;
+	const sessionPath = path.join(sessionDir, files[files.length - 1]!);
+	let content: string;
+	try {
+		content = await readFile(sessionPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const lines = content.split("\n").filter(Boolean);
+	for (let i = lines.length - 1; i >= 0; i--) {
+		try {
+			const entry = JSON.parse(lines[i]!) as {
+				type?: string;
+				message?: { role?: string; content?: Array<{ type?: string; text?: string }> };
+			};
+			if (entry.type !== "message") continue;
+			if (entry.message?.role !== "assistant") continue;
+			const text = entry.message.content
+				?.filter((part) => part.type === "text" && typeof part.text === "string")
+				.map((part) => part.text ?? "")
+				.join("")
+				.trim();
+			if (text) return text;
+		} catch {
+			continue;
+		}
+	}
+	return undefined;
+}
+
+async function summarizeSingleResult(result: SingleResult, sessionDir?: string): Promise<string> {
 	const output = getSingleResultOutput(result).trim();
 	if (output) return truncate(output);
+	if (sessionDir) {
+		const sessionOutput = await readLatestAssistantTextFromSessionDir(sessionDir);
+		if (sessionOutput) return truncate(sessionOutput);
+	}
 	if (result.error?.trim()) return truncate(result.error);
 	return "No assistant output.";
 }
@@ -582,12 +712,13 @@ function buildHistoryBlock(history: AttemptRecord[]): string {
 function buildWorkerTask(run: ActiveRun): string {
 	return [
 		`Goal:\n${run.goal}`,
+		run.brainstormSummary ? `Brainstorm handoff:\n${run.brainstormSummary}` : "",
 		`Criteria for success:\n${run.criteria}`,
 		`Current attempt: #${run.attempt}`,
 		`Previous attempt notes:\n${buildHistoryBlock(run.history)}`,
 		`Reference Goal-Driven prompt:\n${run.filledPrompt}`,
 		"Continue from the current workspace state and make concrete progress now.",
-	].join("\n\n");
+	].filter(Boolean).join("\n\n");
 }
 
 function buildVerifierTask(run: ActiveRun, workerSummary: string, reason: string): string {
@@ -970,6 +1101,20 @@ function clearUiStatus(): void {
 
 function refreshUiStatus(): void {
 	if (!latestCtx?.hasUI || !latestCtx.ui) return;
+	if (activeBrainstorm && !activeRun) {
+		const brainstorm = activeBrainstorm;
+		latestCtx.ui.setStatus(COMMAND_NAME, `💭 ${brainstormPhaseLabel(brainstorm.phase)}`);
+		latestCtx.ui.setWidget(COMMAND_NAME, (tui, theme) => ({
+			render(width: number): string[] {
+				const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+				return safeWidth < 95
+					? renderBrainstormCompactWidgetLines(brainstorm, theme, safeWidth)
+					: renderBrainstormExpandedWidgetLines(brainstorm, theme, safeWidth);
+			},
+			invalidate(): void {},
+		}));
+		return;
+	}
 	if (!activeRun) {
 		clearUiStatus();
 		return;
@@ -996,6 +1141,150 @@ function refreshUiStatus(): void {
 
 function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
 	latestCtx?.ui?.notify(message, level);
+}
+
+function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
+	return message.role === "assistant";
+}
+
+function getAssistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((part): part is Extract<AssistantMessage["content"][number], { type: "text" }> => part.type === "text")
+		.map((part) => part.text)
+		.join("");
+}
+
+function normalizeCriteriaText(criteria: string): string {
+	return criteria
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n")
+		.trim();
+}
+
+function normalizeGoalText(goal: string): string {
+	return goal
+		.replace(/^[-*]\s+/gm, "")
+		.trim();
+}
+
+function normalizeCriteriaBlock(criteria: string): string {
+	const cleaned = criteria
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.filter((line) => !/^If this looks right/i.test(line))
+		.filter((line) => !/^Reply\s*`?\**ok\**`?/i.test(line))
+		.filter((line) => !(/\bok\b/i.test(line) && /(Goal-Driven|Goal|Criteria)/i.test(line)));
+	return normalizeCriteriaText(cleaned.join("\n"));
+}
+
+function normalizeBrainstormHeadings(text: string): string {
+	return text
+		.replace(/\*\*\s*(Goal|Criteria for success|Criteria)\s*\*\*/gi, "$1")
+		.replace(/\r/g, "")
+		.trim();
+}
+
+function parseBrainstormResult(text: string): BrainstormResult | null {
+	const normalized = normalizeBrainstormHeadings(text);
+	if (!normalized) return null;
+
+	const goalMatch = normalized.match(/(?:^|\n)(?:Goal)\s*[:：]?\s*\n+([\s\S]*?)(?=\n{1,3}(?:Criteria for success|Criteria)\s*[:：]?\s*\n)/i);
+	const criteriaMatch = normalized.match(/(?:^|\n)(?:Criteria for success|Criteria)\s*[:：]?\s*\n+([\s\S]*?)(?=\n{1,3}(?:If this looks right|Reply\s*`?\**ok\**`?|.*\bok\b.*Goal-Driven)|$)/i);
+
+	if (!goalMatch || !criteriaMatch) return null;
+
+	const goal = normalizeGoalText(goalMatch[1] ?? "");
+	const criteria = normalizeCriteriaBlock(criteriaMatch[1] ?? "");
+	if (!goal || !criteria) return null;
+
+	return {
+		goal,
+		criteria,
+		summary: singleLine(goal, 120),
+	};
+}
+
+function brainstormPhaseLabel(phase: BrainstormPhase): string {
+	switch (phase) {
+		case "starting":
+			return "starting";
+		case "researching":
+			return "researching";
+		case "drafting":
+			return "drafting";
+		case "awaiting-confirmation":
+			return "awaiting confirmation";
+	}
+}
+
+function renderBrainstormCompactWidgetLines(state: BrainstormState, theme: Theme, width: number): string[] {
+	const elapsed = formatElapsed(Date.now() - state.startedAt);
+	const left = [
+		theme.fg("accent", "💭 goal-driven brainstorm"),
+		theme.fg("dim", " │ "),
+		theme.fg("warning", theme.bold(`${brainstormPhaseLabel(state.phase)} ${elapsed}`)),
+		theme.fg("dim", " │ "),
+		theme.fg("muted", singleLine(state.lastEvent || state.initialRequest, 120)),
+	].join("");
+	return [
+		appendRightAlignedAdaptiveHint(left, width, theme, [
+			"waiting in chat • stop: /goal-driven stop",
+			"chat • stop: /goal-driven stop",
+			"/goal-driven stop",
+		]),
+	];
+}
+
+function renderBrainstormExpandedWidgetLines(state: BrainstormState, theme: Theme, width: number): string[] {
+	const title = truncateToWidth("💭 goal-driven brainstorm", Math.max(0, width - 8), "…", true);
+	const fillLen = Math.max(0, width - 3 - 1 - visibleWidth(title) - 1);
+	return [
+		truncateToWidth(
+			theme.fg("borderMuted", "───") +
+				theme.fg("accent", ` ${title} `) +
+				theme.fg("borderMuted", "─".repeat(fillLen)),
+			width,
+			"…",
+			true,
+		),
+		truncateToWidth(
+			`  ${theme.fg("muted", "Agent:")} ${theme.fg("text", state.agentName)}  ${theme.fg("muted", "Phase:")} ${theme.fg("warning", brainstormPhaseLabel(state.phase))}  ${theme.fg("muted", "Elapsed:")} ${theme.fg("text", formatElapsed(Date.now() - state.startedAt))}`,
+			width,
+			"…",
+			true,
+		),
+		truncateToWidth(
+			`  ${theme.fg("muted", "Request:")} ${theme.fg("text", singleLine(state.initialRequest, 220))}`,
+			width,
+			"…",
+			true,
+		),
+		truncateToWidth(
+			`  ${theme.fg("muted", "Live:")} ${theme.fg("text", singleLine(state.lastEvent || "Waiting for assistant response...", 220))}`,
+			width,
+			"…",
+			true,
+		),
+		truncateToWidth(
+			`  ${theme.fg("dim", "Reply in chat when prompted. Use /goal-driven stop to cancel.")}`,
+			width,
+			"…",
+			true,
+		),
+	];
+}
+
+function buildBrainstormStatusSummary(state: BrainstormState): string {
+	return [
+		`Brainstorm active with '${state.agentName}'`,
+		`Phase: ${brainstormPhaseLabel(state.phase)}`,
+		`Elapsed: ${formatElapsed(Date.now() - state.startedAt)}`,
+		`Request: ${singleLine(state.initialRequest, 160)}`,
+		`Live: ${singleLine(state.lastEvent || "Waiting for assistant response...", 160)}`,
+		"Reply in chat when prompted. Use /goal-driven stop to cancel.",
+	].join("\n");
 }
 
 function finalizeRun(run: ActiveRun | null, message?: string, level: "info" | "warning" | "error" = "info"): void {
@@ -1034,7 +1323,6 @@ async function runManagedSubagent(
 	const attemptDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-${phase}-${sanitizePathSegment(agent.name)}`);
 	const sessionDir = path.join(attemptDir, "session");
 	const artifactsDir = path.join(attemptDir, "artifacts");
-	const outputPath = path.join(attemptDir, "output.md");
 	await mkdir(sessionDir, { recursive: true });
 	await mkdir(artifactsDir, { recursive: true });
 
@@ -1065,7 +1353,6 @@ async function runManagedSubagent(
 				includeJsonl: true,
 				includeMetadata: true,
 			},
-			outputPath,
 			onUpdate: (update: unknown) => {
 				lastActivityAt = Date.now();
 				run.lastActivityAt = lastActivityAt;
@@ -1098,7 +1385,8 @@ async function runManagedSubagent(
 
 async function runVerification(run: ActiveRun, verifierAgent: AgentConfig, workerSummary: string, reason: string): Promise<VerificationResult> {
 	const verificationRun = await runManagedSubagent(run, verifierAgent, buildVerifierTask(run, workerSummary, reason), "verifier");
-	const text = summarizeSingleResult(verificationRun.result);
+	const verifierSessionDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-verifier-${sanitizePathSegment(verifierAgent.name)}`, "session");
+	const text = await summarizeSingleResult(verificationRun.result, verifierSessionDir);
 	return parseVerificationOutput(text);
 }
 
@@ -1133,7 +1421,8 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 		const workerRun = await runManagedSubagent(run, workerAgent, buildWorkerTask(run), "worker");
 		if (run.stopRequested) break;
 
-		const workerSummary = summarizeSingleResult(workerRun.result);
+		const workerSessionDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-worker-${sanitizePathSegment(workerAgent.name)}`, "session");
+		const workerSummary = await summarizeSingleResult(workerRun.result, workerSessionDir);
 		const reason = workerRun.killedForInactivity
 			? "the subagent was inactive for 5 minutes"
 			: workerRun.result.exitCode === 0
@@ -1201,10 +1490,93 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 }
 
 function getStatusText(): string {
+	if (activeBrainstorm) {
+		return `Active brainstorm\n${buildBrainstormStatusSummary(activeBrainstorm)}`;
+	}
 	const run = getDisplayRun();
 	if (!run) return "No Goal-Driven run is active.";
 	const prefix = activeRun ? "Active run" : "Last archived run";
 	return `${prefix}\n${buildStatusLines(run).join("\n")}`;
+}
+
+async function prepareRunContext(ctx: ExtensionContext): Promise<PreparedRunContext | null> {
+	if (!(await hasGlobalPiSubagentsInstalled())) {
+		ctx.ui.notify(
+			`Missing global pi-subagents install. Install and enable pi-subagents first (expected either ${GLOBAL_SUBAGENTS_EXTENSION_PATH} or a pi-subagents entry in ${GLOBAL_SETTINGS_PATH}).`,
+			"error",
+		);
+		return null;
+	}
+
+	const discovered = discoverAgents(ctx.cwd, "both").agents;
+	if (discovered.length === 0) {
+		ctx.ui.notify("No pi-subagents agents were found. Install and configure pi-subagents first.", "error");
+		return null;
+	}
+
+	const { config, path: configPath } = await loadGoalDrivenConfig(ctx);
+	if (!ctx.model && !(config.provider && config.model)) {
+		ctx.ui.notify("Select a model before starting Goal-Driven, or configure provider/model in pi-goal-driven config.", "error");
+		return null;
+	}
+
+	const selectedAgent = selectConfiguredAgent(discovered, config.defaultAgent);
+	if (selectedAgent.fallbackUsed) {
+		ctx.ui.notify(
+			`[${EXTENSION_NAME}] Configured defaultAgent '${selectedAgent.requestedName}' was not found in ${configPath}. Using '${selectedAgent.agent.name}'.`,
+			"warning",
+		);
+	}
+
+	return { config, configPath, selectedAgent };
+}
+
+function createRun(
+	setup: SetupResult,
+	ctx: ExtensionContext,
+	config: GoalDrivenConfig,
+	thinkingLevel: string,
+): ActiveRun {
+	const now = Date.now();
+	return {
+		goal: setup.goal,
+		criteria: setup.criteria,
+		brainstormSummary: setup.brainstormSummary,
+		filledPrompt: fillPromptTemplate(setup.goal, setup.criteria),
+		cwd: ctx.cwd,
+		modelConfig: buildRunModelConfig(ctx, config),
+		thinkingLevel,
+		startedAt: now,
+		attempt: 0,
+		attemptStartedAt: now,
+		state: "running",
+		lastActivityAt: now,
+		lastEvent: setup.brainstormSummary ? `Preparing Goal-Driven run: ${setup.brainstormSummary}` : "Preparing Goal-Driven run",
+		history: [],
+		dashboardExpanded: false,
+		stopRequested: false,
+		agentName: setup.agentName,
+		debugDir: "",
+	};
+}
+
+async function startGoalDrivenRun(
+	setup: SetupResult,
+	ctx: ExtensionContext,
+	thinkingLevel: string,
+	prepared?: PreparedRunContext,
+): Promise<void> {
+	const preparedContext = prepared ?? await prepareRunContext(ctx);
+	if (!preparedContext) return;
+	const run = createRun(setup, ctx, preparedContext.config, thinkingLevel);
+	run.debugDir = await createRunDebugDir(ctx.cwd);
+	activeRun = run;
+	latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
+	await persistRunSnapshot(run);
+	void supervise(run, preparedContext.selectedAgent.agent).catch((error: unknown) => {
+		const message = error instanceof Error ? error.message : String(error);
+		finalizeRun(run, `Goal-Driven crashed: ${message}`, "error");
+	});
 }
 
 async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string): Promise<SetupResult | null> {
@@ -1220,7 +1592,133 @@ async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string):
 	return { goal, criteria, agentName };
 }
 
+async function collectBrainstormRequest(ctx: ExtensionContext, initialArgs: string): Promise<string | null> {
+	const inline = initialArgs.trim();
+	if (inline) return inline;
+	const drafted = await ctx.ui.editor(
+		"Goal-Driven brainstorm",
+		"Describe the task, feature, or outcome you want Goal-Driven to execute after we lock the Goal and Criteria for success.",
+	);
+	const request = drafted?.trim();
+	return request || null;
+}
+
+async function startGoalDrivenBrainstorm(pi: ExtensionAPI, ctx: ExtensionContext, request: string): Promise<void> {
+	if (activeRun || activeBrainstorm) {
+		ctx.ui.notify(getStatusText(), "info");
+		return;
+	}
+
+	const prepared = await prepareRunContext(ctx);
+	if (!prepared) return;
+
+	const startedAt = Date.now();
+	activeBrainstorm = {
+		agentName: prepared.selectedAgent.agent.name,
+		initialRequest: request,
+		startedAt,
+		prepared,
+		thinkingLevel: pi.getThinkingLevel(),
+		phase: "starting",
+		lastEvent: "Preparing brainstorm context...",
+		draftPath: brainstormDraftPath(ctx.cwd, startedAt),
+	};
+	await persistBrainstormDraft(activeBrainstorm);
+	refreshUiStatus();
+	ctx.ui.notify(`Starting Goal-Driven brainstorm with '${prepared.selectedAgent.agent.name}'...`, "info");
+	pi.sendUserMessage(request.trim());
+}
+
 export default function goalDriven(pi: ExtensionAPI): void {
+	pi.on("before_agent_start", async (event) => {
+		if (!activeBrainstorm) return;
+		activeBrainstorm.phase = "researching";
+		activeBrainstorm.lastEvent = "Understanding the request and current repo context...";
+		await persistBrainstormDraft(activeBrainstorm);
+		refreshUiStatus();
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${GOAL_DRIVEN_BRAINSTORM_SYSTEM_PROMPT}`,
+		};
+	});
+
+	pi.on("message_update", async (event) => {
+		if (!activeBrainstorm) return;
+		if (!isAssistantMessage(event.message)) return;
+		const assistantText = getAssistantText(event.message).trim();
+		if (assistantText) {
+			activeBrainstorm.lastEvent = singleLine(assistantText, 180);
+		}
+		if (assistantText.includes("If this looks right") || /reply\s+\*{0,2}`?ok`?\*{0,2}/i.test(assistantText)) {
+			activeBrainstorm.phase = "awaiting-confirmation";
+			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
+		} else if (assistantText.includes("Proposed Goal:") || assistantText.includes("Criteria for success:") || assistantText.includes("Goal\n") || assistantText.includes("Goal  ")) {
+			activeBrainstorm.phase = "drafting";
+		}
+		const parsed = parseBrainstormResult(assistantText);
+		if (parsed) {
+			activeBrainstorm.latestDraft = parsed;
+			activeBrainstorm.phase = "awaiting-confirmation";
+			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
+		}
+		await persistBrainstormDraft(activeBrainstorm);
+		refreshUiStatus();
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (!activeBrainstorm) return;
+		if (!isAssistantMessage(event.message)) return;
+		const assistantText = getAssistantText(event.message);
+		if (assistantText.trim()) {
+			activeBrainstorm.lastEvent = singleLine(assistantText, 180);
+		}
+		if (assistantText.includes("If this looks right") || /reply\s+\*{0,2}`?ok`?\*{0,2}/i.test(assistantText)) {
+			activeBrainstorm.phase = "awaiting-confirmation";
+			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
+		}
+		const parsed = parseBrainstormResult(assistantText);
+		if (parsed) {
+			activeBrainstorm.latestDraft = parsed;
+			activeBrainstorm.phase = "awaiting-confirmation";
+			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
+		}
+		await persistBrainstormDraft(activeBrainstorm);
+		refreshUiStatus();
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (!activeBrainstorm) return;
+		if (event.source !== "interactive") return;
+		const reply = event.text.trim();
+		if (reply.startsWith("/")) return;
+		if (reply.toLowerCase() === "ok") {
+			const draft = activeBrainstorm.latestDraft;
+			if (!draft) {
+				activeBrainstorm.lastEvent = "Still waiting for a draft before confirmation can start Goal-Driven.";
+				await persistBrainstormDraft(activeBrainstorm);
+				refreshUiStatus();
+				ctx.ui.notify("No Goal / Criteria draft is ready yet. Wait for the draft, then reply with ok.", "warning");
+				return { action: "handled" };
+			}
+			const state = activeBrainstorm;
+			activeBrainstorm = null;
+			refreshUiStatus();
+			ctx.ui.notify("Confirmed. Starting Goal-Driven…", "info");
+			await startGoalDrivenRun(
+				{
+					goal: draft.goal,
+					criteria: draft.criteria,
+					agentName: state.agentName,
+					brainstormSummary: draft.summary,
+				},
+				ctx,
+				state.thinkingLevel,
+				state.prepared,
+			);
+			return { action: "handled" };
+		}
+		return { action: "continue" };
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		latestArchivedRun = await restoreLatestArchivedRun(ctx.cwd);
@@ -1228,6 +1726,8 @@ export default function goalDriven(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		activeBrainstorm = null;
+		refreshUiStatus();
 		if (activeRun) {
 			requestStop("Pi session ended.");
 			finalizeRun(activeRun);
@@ -1248,16 +1748,42 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand(BRAINSTORM_COMMAND_NAME, {
+		description: "Brainstorm Goal + Criteria for success, then start Goal-Driven automatically",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			const request = await collectBrainstormRequest(ctx, args);
+			if (!request) {
+				ctx.ui.notify("Goal-Driven brainstorm cancelled.", "info");
+				return;
+			}
+			await startGoalDrivenBrainstorm(pi, ctx, request);
+		},
+	});
+
 	pi.registerCommand(COMMAND_NAME, {
 		description: "Start or manage a Goal-Driven master/subagent run",
 		getArgumentCompletions(prefix) {
-			return ["setup", "status", "stop"]
+			return ["brainstorm", "setup", "status", "stop"]
 				.filter((item) => item.startsWith(prefix))
-				.map((item) => ({ value: item, label: item }));
+				.map((item) => ({
+					value: item,
+					label: item === "brainstorm" ? `${item} (same as /${BRAINSTORM_COMMAND_NAME})` : item,
+				}));
 		},
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
 			const action = args.trim().toLowerCase();
+
+			if (action === "brainstorm") {
+				const request = await collectBrainstormRequest(ctx, "");
+				if (!request) {
+					ctx.ui.notify("Goal-Driven brainstorm cancelled.", "info");
+					return;
+				}
+				await startGoalDrivenBrainstorm(pi, ctx, request);
+				return;
+			}
 
 			if (action === "setup") {
 				if (await pathExists(GLOBAL_CONFIG_PATH)) {
@@ -1276,6 +1802,12 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			}
 
 			if (action === "stop") {
+				if (activeBrainstorm) {
+					activeBrainstorm = null;
+					refreshUiStatus();
+					ctx.ui.notify("Stopping Goal-Driven brainstorm...", "info");
+					return;
+				}
 				if (!requestStop("Stopped by user.")) {
 					ctx.ui.notify("No Goal-Driven run is active.", "info");
 					return;
@@ -1285,76 +1817,28 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			}
 
 			if (action.length > 0) {
-				ctx.ui.notify("Usage: /goal-driven, /goal-driven setup, /goal-driven status, or /goal-driven stop", "warning");
+				ctx.ui.notify(
+					"Usage: /goal-driven, /goal-driven brainstorm, /goal-driven:brainstorm, /goal-driven setup, /goal-driven status, or /goal-driven stop",
+					"warning",
+				);
 				return;
 			}
 
-			if (activeRun) {
+			if (activeRun || activeBrainstorm) {
 				ctx.ui.notify(getStatusText(), "info");
 				return;
 			}
 
-			if (!(await hasGlobalPiSubagentsInstalled())) {
-				ctx.ui.notify(
-					`Missing global pi-subagents install. Install and enable pi-subagents first (expected either ${GLOBAL_SUBAGENTS_EXTENSION_PATH} or a pi-subagents entry in ${GLOBAL_SETTINGS_PATH}).`,
-					"error",
-				);
-				return;
-			}
+			const prepared = await prepareRunContext(ctx);
+			if (!prepared) return;
 
-			const discovered = discoverAgents(ctx.cwd, "both").agents;
-			if (discovered.length === 0) {
-				ctx.ui.notify("No pi-subagents agents were found. Install and configure pi-subagents first.", "error");
-				return;
-			}
-
-			const { config, path: configPath } = await loadGoalDrivenConfig(ctx);
-			if (!ctx.model && !(config.provider && config.model)) {
-				ctx.ui.notify("Select a model before starting Goal-Driven, or configure provider/model in pi-goal-driven config.", "error");
-				return;
-			}
-			const selectedAgent = selectConfiguredAgent(discovered, config.defaultAgent);
-			if (selectedAgent.fallbackUsed) {
-				ctx.ui.notify(
-					`[${EXTENSION_NAME}] Configured defaultAgent '${selectedAgent.requestedName}' was not found in ${configPath}. Using '${selectedAgent.agent.name}'.`,
-					"warning",
-				);
-			}
-
-			const setup = await collectGoalDrivenInput(ctx, selectedAgent.agent.name);
+			const setup = await collectGoalDrivenInput(ctx, prepared.selectedAgent.agent.name);
 			if (!setup) {
 				ctx.ui.notify("Goal-Driven start cancelled.", "info");
 				return;
 			}
 
-			const now = Date.now();
-			const run: ActiveRun = {
-				goal: setup.goal,
-				criteria: setup.criteria,
-				filledPrompt: fillPromptTemplate(setup.goal, setup.criteria),
-				cwd: ctx.cwd,
-				modelConfig: buildRunModelConfig(ctx, config),
-				thinkingLevel: pi.getThinkingLevel(),
-				startedAt: now,
-				attempt: 0,
-				attemptStartedAt: now,
-				state: "running",
-				lastActivityAt: now,
-				lastEvent: "Preparing Goal-Driven run",
-				history: [],
-				dashboardExpanded: false,
-				stopRequested: false,
-				agentName: selectedAgent.agent.name,
-				debugDir: await createRunDebugDir(ctx.cwd),
-			};
-			activeRun = run;
-			latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
-			await persistRunSnapshot(run);
-
-			void supervise(run, selectedAgent.agent).catch((error: unknown) => {
-				const message = error instanceof Error ? error.message : String(error);
-				finalizeRun(run, `Goal-Driven crashed: ${message}`, "error");
-			});
+			await startGoalDrivenRun(setup, ctx, pi.getThinkingLevel(), prepared);
 		},
 	});
 

@@ -21,7 +21,9 @@ Also inspired by [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-aut
 
 Instead of pasting the long prompt by hand, the package gives you a `/goal-driven` command with a Pi-native setup flow.
 
-The flow lets you:
+It also provides `/goal-driven:brainstorm`, which acts like a lightweight `ce:brainstorm`-style front door for Goal-Driven: it helps you refine the Goal and Criteria for success through normal chat, asks follow-up questions only when needed, asks for confirmation, then automatically starts the supervised Goal-Driven run without copy-pasting.
+
+The standard `/goal-driven` flow lets you:
 
 - use the configured `pi-subagents` worker profile
 - enter the `Goal`
@@ -97,9 +99,12 @@ Refactor the auth flow to remove duplicated token parsing logic and keep behavio
 4. `npx eslint . --quiet` passes.
 ```
 
-Useful follow-up commands:
+Useful commands:
 
 ```text
+/goal-driven
+/goal-driven brainstorm
+/goal-driven:brainstorm
 /goal-driven status
 /goal-driven stop
 ```
@@ -138,6 +143,35 @@ While the loop is running, every worker cycle is shown as an **experiment** in t
 - `Ctrl+Shift+X` opens a fullscreen scrollable dashboard
 - the latest run snapshot is persisted, so you can still inspect the experiment history after restarting Pi
 
+### `/goal-driven:brainstorm`
+
+Starts an interactive brainstorming pass for Goal-Driven.
+
+You can pass the task inline:
+
+```text
+/goal-driven:brainstorm Build an Open Agents-style submodule inside the current app
+```
+
+Or run it without arguments and fill the prompt in the editor.
+
+The brainstorm flow will:
+
+- inspect the repo as needed
+- ask follow-up questions only when they materially improve scope or success criteria
+- draft a refined `Goal`
+- draft strict `Criteria for success`
+- ask you to confirm, explicitly telling you that `ok` will immediately launch Goal-Driven
+- automatically launch `/goal-driven` with the confirmed Goal + Criteria
+
+This avoids manually copying brainstorm output into the Goal-Driven dialog.
+
+You can also launch the same flow as a subcommand:
+
+```text
+/goal-driven brainstorm
+```
+
 ### `/goal-driven setup`
 
 Copies the default config to:
@@ -168,7 +202,7 @@ Each attempt now writes worker/verifier output under:
 ~/.pi/agent/extensions/pi-goal-driven/runs/
 ```
 
-Inside each run directory you will find per-attempt `session/`, `artifacts/`, and `output.md` files for both worker and verifier.
+Inside each run directory you will find per-attempt `session/` and `artifacts/` directories for both worker and verifier.
 
 ### `/goal-driven stop`
 
@@ -181,4 +215,5 @@ Stops the current Goal-Driven run and kills the active subprocess.
 - `pi-subagents` is a hard prerequisite for this plugin. `/goal-driven` accepts either the extracted extension path or an installed `pi-subagents` package entry in `~/.pi/agent/settings.json`.
 - The verifier is read-only in practice: it gets inspection tools plus `bash` for checks, but no edit/write tools.
 - The extension keeps a short history of recent failed attempts and feeds that back into the next worker attempt.
-- The package only activates when you explicitly run `/goal-driven`, so it does not constantly inject the Goal-Driven prompt into normal Pi conversations.
+- `/goal-driven:brainstorm` temporarily injects a brainstorm-specific system prompt only while that brainstorm is active, then hands off the confirmed Goal and Criteria directly into the supervised run.
+- The package only activates when you explicitly run `/goal-driven` or `/goal-driven:brainstorm`, so it does not constantly inject the Goal-Driven prompt into normal Pi conversations.
