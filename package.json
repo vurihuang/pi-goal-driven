@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Goal-Driven master/subagent supervisor for pi",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/vurihuang/pi-goal-driven.git"
+  },
+  "homepage": "https://github.com/vurihuang/pi-goal-driven#readme",
+  "bugs": {
+    "url": "https://github.com/vurihuang/pi-goal-driven/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -23,11 +31,16 @@
   "files": [
     "index.ts",
     "config.json",
-    "README.md"
+    "README.md",
+    "showcase-1.png",
+    "showcase-2.png"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "pack:check": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"

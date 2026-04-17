@@ -8,8 +8,8 @@
 
 <table>
   <tr>
-    <td><img src="./showcase-1.png" alt="Goal-Driven inline experiment dashboard" width="420" /></td>
-    <td><img src="./showcase-2.png" alt="Goal-Driven fullscreen experiment dashboard" width="420" /></td>
+    <td><img src="https://raw.githubusercontent.com/vurihuang/pi-goal-driven/master/showcase-1.png" alt="Goal-Driven inline experiment dashboard" width="420" /></td>
+    <td><img src="https://raw.githubusercontent.com/vurihuang/pi-goal-driven/master/showcase-2.png" alt="Goal-Driven fullscreen experiment dashboard" width="420" /></td>
   </tr>
 </table>
 
