@@ -1,7 +1,3 @@
 {
-  "defaultAgent": "worker",
-  "target": {
-    "provider": "",
-    "model": ""
-  }
+  "defaultAgent": "worker"
 }

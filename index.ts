@@ -117,7 +117,6 @@ interface GoalDrivenConfig {
 
 interface RunModelConfig {
 	primary?: string;
-	fallbacks: string[];
 	exactTarget: boolean;
 }
 
@@ -405,39 +404,19 @@ function selectConfiguredAgent(
 	return { agent: fallbackAgent, requestedName: configuredName, fallbackUsed: true };
 }
 
-function canonicalizeGoalDrivenModelId(modelId: string): string {
-	const normalized = modelId.trim();
-	if (!normalized) return normalized;
-	if (/^gpt-5\.\d+(?:[.-][A-Za-z0-9]+)*$/i.test(normalized)) {
-		return normalized.replace(/\./g, "-");
-	}
-	return normalized;
-}
-
-function buildModelRefs(provider: string | undefined, modelId: string | undefined): string[] {
-	if (!provider || !modelId) return [];
-	const normalizedModelId = modelId.trim();
-	const variants = new Set<string>();
-	for (const candidate of [
-		canonicalizeGoalDrivenModelId(normalizedModelId),
-		normalizedModelId,
-		normalizedModelId.replace(/\./g, "-"),
-		normalizedModelId.replace(/-/g, "."),
-	]) {
-		const normalized = candidate.trim();
-		if (normalized) variants.add(`${provider}/${normalized}`);
-	}
-	return [...variants];
+function buildModelRef(provider: string | undefined, modelId: string | undefined): string | undefined {
+	const normalizedProvider = provider?.trim();
+	const normalizedModelId = modelId?.trim();
+	if (!normalizedProvider || !normalizedModelId) return undefined;
+	return `${normalizedProvider}/${normalizedModelId}`;
 }
 
 function buildRunModelConfig(ctx: ExtensionContext, config: GoalDrivenConfig): RunModelConfig {
 	const hasConfiguredModel = Boolean(config.provider && config.model);
-	const refs = hasConfiguredModel
-		? buildModelRefs(config.provider, config.model)
-		: buildModelRefs(ctx.model?.provider, ctx.model?.id);
 	return {
-		primary: refs[0],
-		fallbacks: refs.slice(1),
+		primary: hasConfiguredModel
+			? buildModelRef(config.provider, config.model)
+			: buildModelRef(ctx.model?.provider, ctx.model?.id),
 		exactTarget: hasConfiguredModel,
 	};
 }
@@ -503,21 +482,9 @@ async function pathExists(targetPath: string): Promise<boolean> {
 	}
 }
 
-function mergeFallbackModels(...lists: Array<string[] | undefined>): string[] | undefined {
-	const merged = new Set<string>();
-	for (const list of lists) {
-		for (const entry of list ?? []) {
-			const normalized = entry.trim();
-			if (normalized) merged.add(normalized);
-		}
-	}
-	return merged.size > 0 ? [...merged] : undefined;
-}
-
 function buildWorkerAgent(
 	baseAgent: AgentConfig,
 	thinkingLevel: string,
-	modelFallbacks: string[],
 	exactTarget: boolean,
 ): AgentConfig {
 	return {
@@ -525,7 +492,7 @@ function buildWorkerAgent(
 		name: "goal-driven-worker",
 		description: `Goal-Driven worker based on ${baseAgent.name}`,
 		tools: baseAgent.tools,
-		fallbackModels: mergeFallbackModels(modelFallbacks, baseAgent.fallbackModels),
+		fallbackModels: undefined,
 		systemPrompt: mergeSystemPrompt(baseAgent.systemPrompt, WORKER_SYSTEM_PROMPT),
 		thinking: exactTarget || thinkingLevel === "off" ? undefined : thinkingLevel,
 	};
@@ -534,7 +501,6 @@ function buildWorkerAgent(
 function buildVerifierAgent(
 	baseAgent: AgentConfig,
 	thinkingLevel: string,
-	modelFallbacks: string[],
 	exactTarget: boolean,
 ): AgentConfig {
 	return {
@@ -543,7 +509,7 @@ function buildVerifierAgent(
 		tools: [...VERIFIER_TOOLS],
 		mcpDirectTools: [],
 		model: baseAgent.model,
-		fallbackModels: mergeFallbackModels(modelFallbacks, baseAgent.fallbackModels),
+		fallbackModels: undefined,
 		thinking: exactTarget || thinkingLevel === "off" ? undefined : thinkingLevel,
 		systemPrompt: VERIFIER_SYSTEM_PROMPT,
 		source: baseAgent.source,
@@ -1046,13 +1012,11 @@ async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> 
 	const workerAgent = buildWorkerAgent(
 		baseAgent,
 		run.thinkingLevel,
-		run.modelConfig.fallbacks,
 		run.modelConfig.exactTarget,
 	);
 	const verifierAgent = buildVerifierAgent(
 		baseAgent,
 		run.thinkingLevel,
-		run.modelConfig.fallbacks,
 		run.modelConfig.exactTarget,
 	);
 

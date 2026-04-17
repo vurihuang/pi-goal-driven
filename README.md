@@ -60,10 +60,8 @@ The command prompts for:
 
 It uses the worker configured in `pi-goal-driven` config, and uses either:
 
-- the configured model target from `pi-goal-driven` config, exactly as specified, or
-- your current Pi model when no config target is set
-
-When a config target is set, Goal-Driven does not append the current Pi thinking suffix like `:high`, so a configured model such as `gpt-5-4` stays `gpt-5-4`.
+- the configured `provider` and `model` from `pi-goal-driven` config, or
+- your current Pi session model when no config model is set
 
 While the loop is running, every worker cycle is shown as an **experiment** in the UI:
 
@@ -82,30 +80,15 @@ Copies the default config to:
 ~/.pi/agent/extensions/pi-goal-driven/config.json
 ```
 
-You can also create a project-local config at either:
-
-- `.pi-goal-driven.json`
-- `.pi/pi-goal-driven.json`
+This is the only supported config location.
 
 Config example:
 
 ```json
 {
   "defaultAgent": "worker",
-  "target": {
-    "provider": "openai-codex",
-    "model": "gpt-5-4"
-  }
-}
-```
-
-The config parser also accepts a flat shape:
-
-```json
-{
-  "defaultAgent": "worker",
-  "provider": "openai-codex",
-  "model": "gpt-5-4"
+  "provider": "local",
+  "model": "gpt-5.4"
 }
 ```
 

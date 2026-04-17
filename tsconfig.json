@@ -12,7 +12,6 @@
       "pi-subagents/agents.ts": ["./shims/pi-subagents-agents.d.ts"],
       "pi-subagents/types.ts": ["./shims/pi-subagents-types.d.ts"],
       "pi-subagents/execution.ts": ["./shims/pi-subagents-execution.d.ts"],
-      "pi-subagents/text-editor.ts": ["./shims/pi-subagents-text-editor.d.ts"],
       "pi-subagents/utils.ts": ["./shims/pi-subagents-utils.d.ts"]
     },
     "types": ["node"],
