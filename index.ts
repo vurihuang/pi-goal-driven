@@ -27,7 +27,6 @@ const GLOBAL_AGENT_DIR = getAgentDir();
 const GLOBAL_EXTENSION_DIR = path.join(GLOBAL_AGENT_DIR, "extensions", EXTENSION_NAME);
 const GLOBAL_CONFIG_PATH = path.join(GLOBAL_EXTENSION_DIR, "config.json");
 const GLOBAL_RUNS_DIR = path.join(GLOBAL_EXTENSION_DIR, "runs");
-const GLOBAL_LATEST_RUN_PATH = path.join(GLOBAL_EXTENSION_DIR, "latest-run.json");
 const GLOBAL_SETTINGS_PATH = path.join(GLOBAL_AGENT_DIR, "settings.json");
 const GLOBAL_SUBAGENTS_EXTENSION_PATH = path.join(GLOBAL_AGENT_DIR, "extensions", "pi-subagents", "index.ts");
 
@@ -259,8 +258,19 @@ function sanitizePathSegment(value: string): string {
 	return sanitized || "run";
 }
 
-async function createRunDebugDir(): Promise<string> {
-	const dir = path.join(GLOBAL_RUNS_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`);
+function runsDirForCwd(cwd: string): string {
+	return path.join(GLOBAL_RUNS_DIR, sanitizePathSegment(cwd));
+}
+
+function latestRunSnapshotPathForCwd(cwd: string): string {
+	return path.join(runsDirForCwd(cwd), "latest-run.json");
+}
+
+async function createRunDebugDir(cwd: string): Promise<string> {
+	const dir = path.join(
+		runsDirForCwd(cwd),
+		`${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`,
+	);
 	await mkdir(dir, { recursive: true });
 	return dir;
 }
@@ -306,18 +316,20 @@ function cloneArchivedRun(snapshot: PersistedRunSnapshot): ActiveRun {
 }
 
 async function persistRunSnapshot(run: ActiveRun): Promise<void> {
-	await mkdir(GLOBAL_EXTENSION_DIR, { recursive: true });
-	await writeFile(GLOBAL_LATEST_RUN_PATH, `${JSON.stringify(toPersistedRunSnapshot(run), null, 2)}\n`, "utf8");
+	await mkdir(runsDirForCwd(run.cwd), { recursive: true });
+	await writeFile(latestRunSnapshotPathForCwd(run.cwd), `${JSON.stringify(toPersistedRunSnapshot(run), null, 2)}\n`, "utf8");
 }
 
 async function appendAttemptRecord(run: ActiveRun, attempt: AttemptRecord): Promise<void> {
 	await writeFile(historyLogPath(run), `${JSON.stringify(attempt)}\n`, { encoding: "utf8", flag: "a" });
 }
 
-async function restoreLatestArchivedRun(): Promise<ActiveRun | null> {
-	if (!(await pathExists(GLOBAL_LATEST_RUN_PATH))) return null;
+async function restoreLatestArchivedRun(cwd: string): Promise<ActiveRun | null> {
+	const snapshotPath = latestRunSnapshotPathForCwd(cwd);
+	if (!(await pathExists(snapshotPath))) return null;
 	try {
-		const parsed = JSON.parse(await readFile(GLOBAL_LATEST_RUN_PATH, "utf8")) as PersistedRunSnapshot;
+		const parsed = JSON.parse(await readFile(snapshotPath, "utf8")) as PersistedRunSnapshot;
+		if (parsed.cwd !== cwd) return null;
 		return cloneArchivedRun(parsed);
 	} catch {
 		return null;
@@ -738,10 +750,22 @@ function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): 
 	];
 }
 
-function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+function getDashboardTableLayout(width: number): {
+	idxWidth: number;
+	durWidth: number;
+	resultWidth: number;
+	summaryWidth: number;
+} {
+	const idxWidth = 4;
+	const durWidth = 9;
+	const resultWidth = 12;
+	const summaryWidth = Math.max(20, width - 2 - idxWidth - durWidth - resultWidth);
+	return { idxWidth, durWidth, resultWidth, summaryWidth };
+}
+
+function renderDashboardSummaryLines(run: ActiveRun, theme: Theme, width: number): string[] {
 	const counts = getAttemptCounts(run);
-	const lines: string[] = [];
-	lines.push(
+	return [
 		truncateToWidth(
 			`  ${theme.fg("muted", "Runs:")} ${theme.fg("text", String(counts.started))}` +
 				`  ${theme.fg("success", `${counts.met} met`)}` +
@@ -752,49 +776,65 @@ function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, m
 			"…",
 			true,
 		),
-	);
-	lines.push(
 		truncateToWidth(
 			`  ${theme.fg("muted", "Active:")} ${theme.fg("warning", `★ #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(currentAttemptElapsedMs(run))}`)}`,
 			width,
 			"…",
 			true,
 		),
-	);
-	lines.push(
 		truncateToWidth(
 			`  ${theme.fg("muted", "Live:")} ${theme.fg("text", singleLine(liveSummary(run), 220))}`,
 			width,
 			"…",
 			true,
 		),
-	);
-	lines.push(
 		truncateToWidth(
 			`  ${theme.fg("muted", "Criteria:")} ${theme.fg("muted", singleLine(run.criteria, 220))}`,
 			width,
 			"…",
 			true,
 		),
-	);
-	lines.push("");
+	];
+}
 
-	const idxWidth = 4;
-	const durWidth = 9;
-	const resultWidth = 12;
-	const summaryWidth = Math.max(20, width - idxWidth - durWidth - resultWidth - 6);
+function attemptSummaryPrefix(status: AttemptStatus): string {
+	switch (status) {
+		case "success":
+			return "✓";
+		case "worker_failed":
+			return "✕";
+		case "inactive":
+			return "⏸";
+		default:
+			return "↺";
+	}
+}
+
+function attemptRowColor(theme: Theme, status: AttemptStatus): "text" | "success" | "warning" | "error" {
+	if (status === "success") return "success";
+	if (status === "worker_failed") return "error";
+	if (status === "inactive") return "warning";
+	return "warning";
+}
+
+function renderDashboardTableHeaderLines(theme: Theme, width: number, headerHint?: string): string[] {
+	const layout = getDashboardTableLayout(width);
 	const headerLine =
-		`  ${theme.fg("muted", padCell("#", idxWidth))}` +
-		`${theme.fg("muted", padCell("duration", durWidth))}` +
-		`${theme.fg("muted", padCell("result", resultWidth))}` +
+		`  ${theme.fg("muted", padCell("#", layout.idxWidth))}` +
+		`${theme.fg("muted", padCell("duration", layout.durWidth))}` +
+		`${theme.fg("muted", padCell("result", layout.resultWidth))}` +
 		`${theme.fg("muted", "description")}`;
-	lines.push(
+	return [
 		headerHint
 			? appendRightAlignedAdaptiveHint(headerLine, width, theme, [headerHint, "ctrl+x • c-s-x"])
 			: truncateToWidth(headerLine, width, "…", true),
-	);
-	lines.push(truncateToWidth(`  ${theme.fg("borderMuted", "─".repeat(Math.max(0, width - 4)))}`, width, "…", true));
+		truncateToWidth(`  ${theme.fg("borderAccent", "─".repeat(Math.max(0, width - 2)))}`, width, "…", true),
+	];
+}
 
+function renderDashboardAttemptLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS): string[] {
+	const layout = getDashboardTableLayout(width);
+	const lines: string[] = [];
 	const effectiveMax = maxRows <= 0 ? run.history.length : maxRows;
 	const start = Math.max(0, run.history.length - effectiveMax);
 	if (start > 0) {
@@ -802,26 +842,37 @@ function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, m
 	}
 
 	for (const item of run.history.slice(start)) {
+		const tone = attemptRowColor(theme, item.status);
 		const duration = formatElapsed(item.finishedAt - item.startedAt);
+		const summary = `${attemptSummaryPrefix(item.status)} ${item.summary}`;
 		const row =
-			`  ${theme.fg("dim", padCell(String(item.attempt), idxWidth))}` +
-			`${theme.fg("text", padCell(duration, durWidth))}` +
-			`${padCell(attemptStatusColor(theme, item.status), resultWidth)}` +
-			`${theme.fg("muted", truncateToWidth(item.summary, summaryWidth, "…", true))}`;
+			`  ${theme.fg(tone, padCell(String(item.attempt), layout.idxWidth))}` +
+			`${theme.fg(tone, padCell(duration, layout.durWidth))}` +
+			`${padCell(attemptStatusColor(theme, item.status), layout.resultWidth)}` +
+			`${theme.fg(tone, truncateToWidth(summary, layout.summaryWidth, "…", true))}`;
 		lines.push(truncateToWidth(row, width, "…", true));
 	}
 
 	if (hasInFlightAttempt(run)) {
 		const spinner = OVERLAY_SPINNER[Math.floor(Date.now() / 120) % OVERLAY_SPINNER.length] ?? "•";
 		const row =
-			`  ${theme.fg("dim", padCell(String(run.attempt), idxWidth))}` +
-			`${theme.fg("warning", padCell(formatElapsed(currentAttemptElapsedMs(run)), durWidth))}` +
-			`${padCell(theme.fg("warning", `${spinner} ${currentPhaseLabel(run)}`), resultWidth)}` +
-			`${theme.fg("text", truncateToWidth(singleLine(liveSummary(run), 220), summaryWidth, "…", true))}`;
-		lines.push(truncateToWidth(row, width, "…", true));
+			`  ${theme.fg("accent", padCell(String(run.attempt), layout.idxWidth))}` +
+			`${theme.fg("warning", theme.bold(padCell(formatElapsed(currentAttemptElapsedMs(run)), layout.durWidth)))}` +
+			`${padCell(theme.fg("accent", theme.bold(`${spinner} ${currentPhaseLabel(run)}`)), layout.resultWidth)}` +
+			`${theme.fg("text", truncateToWidth(`★ ${singleLine(liveSummary(run), 220)}`, layout.summaryWidth, "…", true))}`;
+		lines.push(theme.bg("selectedBg", truncateToWidth(row, width, "…", true).padEnd(width, " ")));
 	}
 
 	return lines;
+}
+
+function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
+	return [
+		...renderDashboardSummaryLines(run, theme, width),
+		"",
+		...renderDashboardTableHeaderLines(theme, width, headerHint),
+		...renderDashboardAttemptLines(run, theme, width, maxRows),
+	];
 }
 
 function renderExpandedWidgetLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
@@ -838,6 +889,49 @@ function renderExpandedWidgetLines(run: ActiveRun, theme: Theme, width: number, 
 		),
 		...renderDashboardBodyLines(run, theme, width, maxRows, headerHint),
 	];
+}
+
+function renderBorderBox(theme: Theme, width: number, title: string, bodyLines: string[]): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const safeTitle = truncateToWidth(` ${title} `, innerWidth, "…", true);
+	const safeTitleWidth = visibleWidth(safeTitle);
+	const leftBorderWidth = Math.max(0, Math.floor((innerWidth - safeTitleWidth) / 2));
+	const rightBorderWidth = Math.max(0, innerWidth - safeTitleWidth - leftBorderWidth);
+	const padLine = (line: string) => truncateToWidth(line, innerWidth, "…", true).padEnd(innerWidth, " ");
+	return [
+		theme.fg("border", `╭${"─".repeat(leftBorderWidth)}`) +
+			theme.fg("accent", safeTitle) +
+			theme.fg("border", `${"─".repeat(rightBorderWidth)}╮`),
+		...bodyLines.map((line) => theme.fg("border", "│") + padLine(line) + theme.fg("border", "│")),
+		theme.fg("border", `╰${"─".repeat(innerWidth)}╯`),
+	];
+}
+
+function renderFullscreenOverlayLines(run: ActiveRun, theme: Theme, width: number, viewportRows: number, scrollOffset: number): {
+	lines: string[];
+	totalRows: number;
+} {
+	const innerWidth = Math.max(1, width - 2);
+	const summaryLines = renderDashboardSummaryLines(run, theme, innerWidth);
+	const fixedTableHeaderLines = renderDashboardTableHeaderLines(theme, innerWidth, "esc close • ↑↓ scroll");
+	const attemptLines = renderDashboardAttemptLines(run, theme, innerWidth, 0);
+	const fixedLines = [...summaryLines, "", ...fixedTableHeaderLines];
+	const visibleBodyRows = Math.max(1, viewportRows - fixedLines.length - 1);
+	const maxScroll = Math.max(0, attemptLines.length - visibleBodyRows);
+	const clampedOffset = clamp(scrollOffset, 0, maxScroll);
+	const visibleBody = attemptLines.slice(clampedOffset, clampedOffset + visibleBodyRows);
+	while (visibleBody.length < visibleBodyRows) visibleBody.push("");
+	const scrollInfo = attemptLines.length > visibleBodyRows
+		? ` ${clampedOffset + 1}-${Math.min(clampedOffset + visibleBodyRows, attemptLines.length)}/${attemptLines.length}`
+		: "";
+	const helpText = width >= 85
+		? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
+		: ` j/k scroll • esc close${scrollInfo} `;
+	const footer = appendRightAlignedAdaptiveHint("", innerWidth, theme, [helpText.trim(), `esc${scrollInfo}`]);
+	return {
+		lines: renderBorderBox(theme, width, runTitle(run), [...fixedLines, ...visibleBody, footer]),
+		totalRows: attemptLines.length,
+	};
 }
 
 function buildStatusLines(run: ActiveRun): string[] {
@@ -1129,7 +1223,7 @@ async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string):
 export default function goalDriven(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
-		latestArchivedRun = await restoreLatestArchivedRun();
+		latestArchivedRun = await restoreLatestArchivedRun(ctx.cwd);
 		refreshUiStatus();
 	});
 
@@ -1251,7 +1345,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				dashboardExpanded: false,
 				stopRequested: false,
 				agentName: selectedAgent.agent.name,
-				debugDir: await createRunDebugDir(),
+				debugDir: await createRunDebugDir(ctx.cwd),
 			};
 			activeRun = run;
 			latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
@@ -1300,30 +1394,12 @@ export default function goalDriven(pi: ExtensionAPI): void {
 						render(width: number): string[] {
 							const safeWidth = Math.max(1, width || getTuiSize(tui).width);
 							const viewportRows = Math.max(8, getTuiSize(tui).height - 4);
-							const content = renderExpandedWidgetLines(run, theme, safeWidth, 0);
-							lastTotalRows = content.length;
-							lastViewportRows = viewportRows;
-							const maxScroll = Math.max(0, lastTotalRows - viewportRows);
+							const overlay = renderFullscreenOverlayLines(run, theme, safeWidth, viewportRows, scrollOffset);
+							lastTotalRows = overlay.totalRows;
+							lastViewportRows = Math.max(1, viewportRows - 1);
+							const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
 							scrollOffset = clamp(scrollOffset, 0, maxScroll);
-							const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
-							const lines = [...visible];
-							while (lines.length < viewportRows) lines.push("");
-							const scrollInfo = lastTotalRows > viewportRows
-								? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, lastTotalRows)}/${lastTotalRows}`
-								: "";
-							const helpText = safeWidth >= 85
-								? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
-								: ` j/k scroll • esc close${scrollInfo} `;
-							const footFill = Math.max(0, safeWidth - visibleWidth(helpText));
-							lines.push(
-								truncateToWidth(
-									theme.fg("borderMuted", "─".repeat(footFill)) + theme.fg("dim", helpText),
-									safeWidth,
-									"…",
-									true,
-								),
-							);
-							return lines;
+							return overlay.lines;
 						},
 						handleInput(data: string): void {
 							const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
@@ -1348,9 +1424,10 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				{
 					overlay: true,
 					overlayOptions: {
-						width: "95%",
-						maxHeight: "90%",
+						width: "92%",
+						maxHeight: "88%",
 						anchor: "center" as const,
+						margin: 1,
 					},
 				},
 			);

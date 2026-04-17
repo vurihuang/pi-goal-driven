@@ -1,6 +1,23 @@
 # pi-goal-driven
 
+[![npm version](https://img.shields.io/npm/v/pi-goal-driven)](https://www.npmjs.com/package/pi-goal-driven)
+[![npm downloads](https://img.shields.io/npm/dm/pi-goal-driven)](https://www.npmjs.com/package/pi-goal-driven)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](https://www.npmjs.com/package/pi-goal-driven)
+
+## Showcase
+
+<table>
+  <tr>
+    <td><img src="./showcase-1.png" alt="Goal-Driven inline experiment dashboard" width="420" /></td>
+    <td><img src="./showcase-2.png" alt="Goal-Driven fullscreen experiment dashboard" width="420" /></td>
+  </tr>
+</table>
+
 A Pi package that turns the [Goal-Driven](https://github.com/lidangzzz/goal-driven) master/subagent pattern into a Pi-native extension.
+
+Special thanks to [lidangzzz/goal-driven](https://github.com/lidangzzz/goal-driven) — it's a great project and the direct inspiration for this package.
+
+Also inspired by [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).
 
 Instead of pasting the long prompt by hand, the package gives you a `/goal-driven` command with a Pi-native setup flow.
 
@@ -22,18 +39,26 @@ Then it starts a supervised loop:
 
 You must already have the global [`pi-subagents`](https://github.com/nicobailon/pi-subagents) Pi extension installed and enabled before using this plugin.
 
-A normal package install via `pi install pi-subagents` is enough. `pi-goal-driven` now accepts either:
+A normal package install via `pi install npm:pi-subagents` is enough. `pi-goal-driven` now accepts either:
 
 - an extracted extension file at `~/.pi/agent/extensions/pi-subagents/index.ts`, or
 - a `pi-subagents` package entry in `~/.pi/agent/settings.json`
 
 ```bash
-pi install pi-subagents
+pi install npm:pi-subagents
 ```
 
 `pi-goal-driven` now relies on that global `pi-subagents` extension for worker runs instead of injecting its own bundled extension copy.
 
 ## Install
+
+Recommended:
+
+```bash
+pi install npm:pi-goal-driven
+```
+
+Local development:
 
 ```bash
 pi install /path/to/pi-goal-driven
@@ -46,6 +71,47 @@ pi -e /path/to/pi-goal-driven
 ```
 
 This package uses `pi-subagents` internally for worker execution, but Goal-Driven worker sessions expect the global `pi-subagents` extension to be present.
+
+## Quick example
+
+After installing `pi-subagents` and `pi-goal-driven`, start Pi in the target repo and run:
+
+```text
+/goal-driven
+```
+
+Then fill in a goal and success criteria such as:
+
+**Goal**
+
+```text
+Refactor the auth flow to remove duplicated token parsing logic and keep behavior unchanged.
+```
+
+**Criteria for success**
+
+```text
+1. Token parsing lives in one shared implementation.
+2. Existing auth routes still behave the same.
+3. `npx tsc --noEmit` passes.
+4. `npx eslint . --quiet` passes.
+```
+
+Useful follow-up commands:
+
+```text
+/goal-driven status
+/goal-driven stop
+```
+
+Typical flow:
+
+1. run `/goal-driven`
+2. enter the goal
+3. enter the criteria for success
+4. let the worker run and the verifier check progress automatically
+5. use `/goal-driven status` to inspect the latest run
+6. use `/goal-driven stop` if you want to stop supervision manually
 
 ## Commands
 
@@ -87,7 +153,7 @@ Config example:
 ```json
 {
   "defaultAgent": "worker",
-  "provider": "local",
+  "provider": "openai",
   "model": "gpt-5.4"
 }
 ```
