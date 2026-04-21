@@ -1,4 +1,5 @@
-import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -23,6 +24,20 @@ const CRITERIA_PLACEHOLDER = "[[[[[DEFINE YOUR CRITERIA FOR SUCCESS HERE]]]]]";
 const PLACEHOLDER_TOKEN = "[[[[[";
 const MASTER_MET_VERDICT = "GOAL_DRIVEN_VERDICT: MET";
 const GOAL_DRIVEN_WORKER_AGENT = "worker";
+const GOAL_DRIVEN_ASYNC_RUN_ENTRY = `${EXTENSION_NAME}:async-run`;
+const GOAL_DRIVEN_WORKER_TASK_GUARD = [
+	"Goal-Driven worker execution rules:",
+	"- Do the implementation work directly in this worker session.",
+	"- Do not call the subagent tool.",
+	"- Do not launch nested agents, chains, or parallel worker runs.",
+	"- Do not run /goal-driven commands inside the worker session.",
+	"- If you think delegation is needed, do the work yourself instead.",
+].join("\n");
+const GOAL_DRIVEN_ASYNC_RUNS_DIR = path.join(
+	os.tmpdir(),
+	`pi-subagents-uid-${typeof process.getuid === "function" ? process.getuid() : "unknown"}`,
+	"async-subagent-runs",
+);
 const WATCHDOG_POLL_MS = 15_000;
 const WATCHDOG_INACTIVE_TIMEOUT_MS = 15 * 60 * 1000;
 const WATCHDOG_STOP_REASON = "Stopped by Goal-Driven inactivity watchdog";
@@ -41,6 +56,7 @@ const USAGE_TEXT = [
 
 type RunPhase = "working" | "verifying";
 type AsyncRunState = "queued" | "running" | "complete" | "failed";
+type AsyncRunStopOutcome = "stopped" | "already-finished" | "missing" | "error";
 
 interface ActiveBrainstorm {
 	cwd: string;
@@ -60,8 +76,50 @@ interface AsyncRunSnapshot {
 	outputFile: string | null;
 }
 
+interface GoalDrivenAsyncRunEntry {
+	sessionId: string;
+	sessionFile: string | null;
+	asyncId: string;
+	asyncDir: string | null;
+	cwd: string;
+}
+
+interface AsyncRunStopResult {
+	id: string;
+	outcome: AsyncRunStopOutcome;
+	previousState: AsyncRunState | null;
+	pid: number | null;
+	error?: string;
+}
+
+interface AsyncRunCleanupSummary {
+	stopped: number;
+	alreadyFinished: number;
+	missing: number;
+	errors: number;
+	results: AsyncRunStopResult[];
+}
+
+interface ScopedAsyncRunStatus {
+	id: string;
+	state: AsyncRunState;
+	mode: string | null;
+	currentStep: number | null;
+	totalSteps: number;
+	cwd: string | null;
+	startedAt: number | null;
+	steps: Array<{
+		agent: string;
+		status: string;
+	}>;
+}
+
+type SessionManagerView = ExtensionContext["sessionManager"];
+
 interface ActiveRun {
 	cwd: string;
+	sessionId: string;
+	sessionFile: string | null;
 	goal: string;
 	criteria: string;
 	attempt: number;
@@ -142,6 +200,12 @@ function isSubagentExecutionInput(input: unknown): boolean {
 	return typeof candidate.agent === "string" || Array.isArray(candidate.tasks) || Array.isArray(candidate.chain);
 }
 
+function prependWorkerTaskGuard(task: unknown): unknown {
+	if (typeof task !== "string") return task;
+	if (task.includes(GOAL_DRIVEN_WORKER_TASK_GUARD)) return task;
+	return `${GOAL_DRIVEN_WORKER_TASK_GUARD}\n\n${task}`;
+}
+
 function forceGoalDrivenSubagentExecution(input: unknown): void {
 	if (!input || typeof input !== "object") return;
 	const candidate = input as Record<string, unknown>;
@@ -150,12 +214,15 @@ function forceGoalDrivenSubagentExecution(input: unknown): void {
 
 	if (typeof candidate.agent === "string") {
 		candidate.agent = GOAL_DRIVEN_WORKER_AGENT;
+		candidate.task = prependWorkerTaskGuard(candidate.task);
 	}
 
 	if (Array.isArray(candidate.tasks)) {
 		for (const task of candidate.tasks) {
 			if (!task || typeof task !== "object") continue;
-			(task as Record<string, unknown>).agent = GOAL_DRIVEN_WORKER_AGENT;
+			const taskInput = task as Record<string, unknown>;
+			taskInput.agent = GOAL_DRIVEN_WORKER_AGENT;
+			taskInput.task = prependWorkerTaskGuard(taskInput.task);
 		}
 	}
 
@@ -165,11 +232,14 @@ function forceGoalDrivenSubagentExecution(input: unknown): void {
 		const chainStep = step as Record<string, unknown>;
 		if (typeof chainStep.agent === "string") {
 			chainStep.agent = GOAL_DRIVEN_WORKER_AGENT;
+			chainStep.task = prependWorkerTaskGuard(chainStep.task);
 		}
 		if (!Array.isArray(chainStep.parallel)) continue;
 		for (const parallelStep of chainStep.parallel) {
 			if (!parallelStep || typeof parallelStep !== "object") continue;
-			(parallelStep as Record<string, unknown>).agent = GOAL_DRIVEN_WORKER_AGENT;
+			const parallelInput = parallelStep as Record<string, unknown>;
+			parallelInput.agent = GOAL_DRIVEN_WORKER_AGENT;
+			parallelInput.task = prependWorkerTaskGuard(parallelInput.task);
 		}
 	}
 }
@@ -224,58 +294,298 @@ function trackKnownAsyncRun(run: ActiveRun, asyncId: string, asyncDir: string | 
 	run.latestAsyncDir = asyncDir;
 }
 
-async function stopKnownAsyncRuns(run: ActiveRun, reason = "Stopped by /goal-driven stop"): Promise<number> {
-	let stopped = 0;
-	for (const knownRun of run.knownAsyncRuns) {
-		if (!knownRun.dir) continue;
-		try {
-			const statusPath = path.join(knownRun.dir, "status.json");
-			const raw = await readFile(statusPath, "utf8");
-			const candidate = JSON.parse(raw) as {
-				state?: string;
-				pid?: number;
-				lastUpdate?: number;
-				endedAt?: number;
-				error?: string;
-				steps?: Array<Record<string, unknown>>;
-			};
-			if (candidate.state !== "queued" && candidate.state !== "running") continue;
+function getSessionRef(ctx: ExtensionContext): { sessionId: string; sessionFile: string | null } {
+	return {
+		sessionId: ctx.sessionManager.getSessionId(),
+		sessionFile: ctx.sessionManager.getSessionFile() ?? null,
+	};
+}
 
-			const stoppedAt = Date.now();
-			if (typeof candidate.pid === "number") {
-				try {
-					process.kill(candidate.pid, "SIGTERM");
-				} catch {
-					// The process may have already exited; still rewrite status below.
+function matchesSessionRef(
+	entry: Pick<GoalDrivenAsyncRunEntry, "sessionId" | "sessionFile">,
+	sessionId: string,
+	sessionFile: string | null,
+): boolean {
+	if (entry.sessionId === sessionId) return true;
+	return Boolean(sessionFile && entry.sessionFile && entry.sessionFile === sessionFile);
+}
+
+function collectPersistedKnownAsyncRuns(
+	sessionManager: SessionManagerView,
+	sessionId: string,
+	sessionFile: string | null,
+): KnownAsyncRun[] {
+	const knownRuns = new Map<string, KnownAsyncRun>();
+	for (const entry of sessionManager.getEntries()) {
+		if (entry.type !== "custom" || entry.customType !== GOAL_DRIVEN_ASYNC_RUN_ENTRY) continue;
+		const data = entry.data as Partial<GoalDrivenAsyncRunEntry> | undefined;
+		if (!data || typeof data.asyncId !== "string") continue;
+		const persistedRun: GoalDrivenAsyncRunEntry = {
+			sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
+			sessionFile: typeof data.sessionFile === "string" ? data.sessionFile : null,
+			asyncId: data.asyncId,
+			asyncDir: typeof data.asyncDir === "string" ? data.asyncDir : null,
+			cwd: typeof data.cwd === "string" ? data.cwd : "",
+		};
+		if (!matchesSessionRef(persistedRun, sessionId, sessionFile)) continue;
+		const existing = knownRuns.get(persistedRun.asyncId);
+		if (existing) {
+			if (!existing.dir && persistedRun.asyncDir) existing.dir = persistedRun.asyncDir;
+			continue;
+		}
+		knownRuns.set(persistedRun.asyncId, {
+			id: persistedRun.asyncId,
+			dir: persistedRun.asyncDir,
+		});
+	}
+	return [...knownRuns.values()];
+}
+
+function mergeKnownAsyncRuns(run: ActiveRun, knownAsyncRuns: KnownAsyncRun[]): void {
+	for (const knownRun of knownAsyncRuns) {
+		const existing = run.knownAsyncRuns.find((candidate) => candidate.id === knownRun.id);
+		if (existing) {
+			if (!existing.dir && knownRun.dir) existing.dir = knownRun.dir;
+			continue;
+		}
+		run.knownAsyncRuns.push({ ...knownRun });
+	}
+}
+
+async function hydrateKnownAsyncRuns(run: ActiveRun, sessionManager: SessionManagerView | null | undefined): Promise<void> {
+	if (!sessionManager) return;
+	mergeKnownAsyncRuns(run, collectPersistedKnownAsyncRuns(sessionManager, run.sessionId, run.sessionFile));
+}
+
+function getAsyncRunsDir(knownAsyncRuns: KnownAsyncRun[] = []): string {
+	const knownAsyncDir = knownAsyncRuns.find((knownRun) => knownRun.dir)?.dir;
+	return knownAsyncDir ? path.dirname(knownAsyncDir) : GOAL_DRIVEN_ASYNC_RUNS_DIR;
+}
+
+function getSessionTreeRoot(sessionFile: string | null): string | null {
+	if (!sessionFile) return null;
+	return sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -".jsonl".length) : null;
+}
+
+async function collectSessionTreeAsyncRunIds(sessionTreeRoot: string | null): Promise<string[]> {
+	if (!sessionTreeRoot) return [];
+	const asyncIds = new Set<string>();
+
+	const walk = async (currentDir: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await readdir(currentDir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+			const nextDir = path.join(currentDir, entry.name);
+			if (entry.name.startsWith("async-")) {
+				const asyncId = entry.name.slice("async-".length);
+				if (asyncId) asyncIds.add(asyncId);
+				continue;
+			}
+			await walk(nextDir);
+		}
+	};
+
+	await walk(sessionTreeRoot);
+	return [...asyncIds];
+}
+
+async function stopAsyncRunById(asyncId: string, reason: string, asyncRunsDir: string): Promise<AsyncRunStopResult> {
+	const statusPath = path.join(asyncRunsDir, asyncId, "status.json");
+	try {
+		const raw = await readFile(statusPath, "utf8");
+		const candidate = JSON.parse(raw) as {
+			state?: string;
+			pid?: number;
+			lastUpdate?: number;
+			endedAt?: number;
+			error?: string;
+			steps?: Array<Record<string, unknown>>;
+		};
+		const previousState = candidate.state === "queued"
+			|| candidate.state === "running"
+			|| candidate.state === "complete"
+			|| candidate.state === "failed"
+			? candidate.state
+			: null;
+		const pid = typeof candidate.pid === "number" ? candidate.pid : null;
+		if (previousState !== "queued" && previousState !== "running") {
+			return { id: asyncId, outcome: "already-finished", previousState, pid };
+		}
+
+		const stoppedAt = Date.now();
+		if (pid !== null) {
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch {
+				// The process may have already exited; still rewrite status below.
+			}
+		}
+
+		candidate.state = "failed";
+		candidate.lastUpdate = stoppedAt;
+		candidate.endedAt = stoppedAt;
+		candidate.error = reason;
+		candidate.steps = (candidate.steps ?? []).map((step) => {
+			const nextStep = { ...step };
+			if (nextStep.status === "queued" || nextStep.status === "pending" || nextStep.status === "running") {
+				nextStep.status = "failed";
+				nextStep.endedAt = stoppedAt;
+				if (typeof nextStep.startedAt === "number") {
+					nextStep.durationMs = Math.max(0, stoppedAt - nextStep.startedAt);
+				}
+				if (typeof nextStep.error !== "string" || !nextStep.error) {
+					nextStep.error = reason;
 				}
 			}
+			return nextStep;
+		});
 
-			candidate.state = "failed";
-			candidate.lastUpdate = stoppedAt;
-			candidate.endedAt = stoppedAt;
-			candidate.error = reason;
-			candidate.steps = (candidate.steps ?? []).map((step) => {
-				const nextStep = { ...step };
-				if (nextStep.status === "queued" || nextStep.status === "pending" || nextStep.status === "running") {
-					nextStep.status = "failed";
-					nextStep.endedAt = stoppedAt;
-					if (typeof nextStep.startedAt === "number") {
-						nextStep.durationMs = Math.max(0, stoppedAt - nextStep.startedAt);
-					}
-					if (typeof nextStep.error !== "string" || !nextStep.error) {
-						nextStep.error = reason;
-					}
-				}
-				return nextStep;
-			});
-
-			await writeFile(statusPath, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
-			stopped += 1;
-		} catch {
-			// Best-effort cleanup; ignore missing, finished, or already-dead runs.
+		await writeFile(statusPath, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+		return { id: asyncId, outcome: "stopped", previousState, pid };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message.includes("ENOENT")) {
+			return { id: asyncId, outcome: "missing", previousState: null, pid: null };
 		}
+		return { id: asyncId, outcome: "error", previousState: null, pid: null, error: message };
 	}
-	return stopped;
+}
+
+function summarizeAsyncRunCleanup(results: AsyncRunStopResult[]): AsyncRunCleanupSummary {
+	return {
+		stopped: results.filter((result) => result.outcome === "stopped").length,
+		alreadyFinished: results.filter((result) => result.outcome === "already-finished").length,
+		missing: results.filter((result) => result.outcome === "missing").length,
+		errors: results.filter((result) => result.outcome === "error").length,
+		results,
+	};
+}
+
+async function stopAsyncRunsByIds(asyncIds: string[], reason: string, asyncRunsDir: string): Promise<AsyncRunCleanupSummary> {
+	const uniqueIds = [...new Set(asyncIds.filter(Boolean))];
+	const results: AsyncRunStopResult[] = [];
+	for (const asyncId of uniqueIds) {
+		results.push(await stopAsyncRunById(asyncId, reason, asyncRunsDir));
+	}
+	return summarizeAsyncRunCleanup(results);
+}
+
+async function stopSessionScopedAsyncRuns(
+	sessionFile: string | null,
+	knownAsyncRuns: KnownAsyncRun[],
+	reason: string,
+): Promise<AsyncRunCleanupSummary> {
+	const asyncIds = new Set(knownAsyncRuns.map((knownRun) => knownRun.id));
+	for (const asyncId of await collectSessionTreeAsyncRunIds(getSessionTreeRoot(sessionFile))) {
+		asyncIds.add(asyncId);
+	}
+	return stopAsyncRunsByIds([...asyncIds], reason, getAsyncRunsDir(knownAsyncRuns));
+}
+
+function formatAsyncRunCleanupSummary(summary: AsyncRunCleanupSummary): string {
+	const parts: string[] = [];
+	if (summary.stopped > 0) parts.push(`stopped ${summary.stopped} running ${pluralize(summary.stopped, "worker")}`);
+	if (summary.alreadyFinished > 0) parts.push(`${summary.alreadyFinished} already finished`);
+	if (summary.missing > 0) parts.push(`${summary.missing} missing`);
+	if (summary.errors > 0) parts.push(`${summary.errors} cleanup ${summary.errors === 1 ? "error" : "errors"}`);
+	return parts.length > 0 ? parts.join(", ") : "no async workers found";
+}
+
+async function stopKnownAsyncRuns(run: ActiveRun, reason = "Stopped by /goal-driven stop"): Promise<number> {
+	const summary = await stopAsyncRunsByIds(run.knownAsyncRuns.map((knownRun) => knownRun.id), reason, getAsyncRunsDir(run.knownAsyncRuns));
+	return summary.stopped;
+}
+
+function shortenHomePath(targetPath: string | null): string {
+	if (!targetPath) return "(cwd unknown)";
+	const homeDir = os.homedir();
+	return targetPath.startsWith(homeDir) ? `~${targetPath.slice(homeDir.length)}` : targetPath;
+}
+
+function isSubagentStatusListInput(input: Record<string, unknown>): boolean {
+	return input.action === "list";
+}
+
+async function readScopedAsyncRunStatus(asyncId: string, asyncRunsDir: string): Promise<ScopedAsyncRunStatus | null> {
+	try {
+		const raw = await readFile(path.join(asyncRunsDir, asyncId, "status.json"), "utf8");
+		const candidate = JSON.parse(raw) as {
+			state?: string;
+			mode?: string;
+			currentStep?: number;
+			cwd?: string;
+			startedAt?: number;
+			steps?: Array<{ agent?: string; status?: string }>;
+		};
+		if (
+			candidate.state !== "queued"
+			&& candidate.state !== "running"
+			&& candidate.state !== "complete"
+			&& candidate.state !== "failed"
+		) {
+			return null;
+		}
+		const steps = Array.isArray(candidate.steps)
+			? candidate.steps.map((step) => ({
+				agent: typeof step?.agent === "string" ? step.agent : "worker",
+				status: typeof step?.status === "string" ? step.status : "unknown",
+			}))
+			: [];
+		return {
+			id: asyncId,
+			state: candidate.state,
+			mode: typeof candidate.mode === "string" ? candidate.mode : null,
+			currentStep: typeof candidate.currentStep === "number" ? candidate.currentStep : null,
+			totalSteps: steps.length,
+			cwd: typeof candidate.cwd === "string" ? candidate.cwd : null,
+			startedAt: typeof candidate.startedAt === "number" ? candidate.startedAt : null,
+			steps,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function listSessionScopedActiveAsyncRuns(
+	sessionFile: string | null,
+	knownAsyncRuns: KnownAsyncRun[],
+): Promise<ScopedAsyncRunStatus[]> {
+	const asyncRunsDir = getAsyncRunsDir(knownAsyncRuns);
+	const asyncIds = new Set(knownAsyncRuns.map((knownRun) => knownRun.id));
+	for (const asyncId of await collectSessionTreeAsyncRunIds(getSessionTreeRoot(sessionFile))) {
+		asyncIds.add(asyncId);
+	}
+	const runs: ScopedAsyncRunStatus[] = [];
+	for (const asyncId of asyncIds) {
+		const status = await readScopedAsyncRunStatus(asyncId, asyncRunsDir);
+		if (!status) continue;
+		if (status.state !== "queued" && status.state !== "running") continue;
+		runs.push(status);
+	}
+	return runs.sort((left, right) => (right.startedAt ?? 0) - (left.startedAt ?? 0));
+}
+
+function formatScopedSubagentStatusList(runs: ScopedAsyncRunStatus[]): string {
+	if (runs.length === 0) return "No active async runs in this Goal-Driven session tree.";
+	const lines = [`Active async runs in this Goal-Driven session tree: ${runs.length}`, ""];
+	for (const run of runs) {
+		const stepNumber = run.currentStep === null ? "?" : String(Math.min(run.currentStep + 1, Math.max(run.totalSteps, 1)));
+		const totalSteps = run.totalSteps > 0 ? String(run.totalSteps) : "?";
+		lines.push(
+			`- ${run.id} | ${run.state} | ${run.mode ?? "single"} | step ${stepNumber}/${totalSteps} | ${shortenHomePath(run.cwd)}`,
+		);
+		for (const [index, step] of run.steps.entries()) {
+			lines.push(`  ${index + 1}. ${step.agent} | ${step.status}`);
+		}
+		if (run.steps.length > 0) lines.push("");
+	}
+	if (lines.at(-1) === "") lines.pop();
+	return lines.join("\n");
 }
 
 async function readAsyncRunSnapshot(asyncDir: string | null): Promise<AsyncRunSnapshot | null> {
@@ -346,6 +656,11 @@ function ensureWatchdog(pi: ExtensionAPI): void {
 async function watchdogTick(pi: ExtensionAPI): Promise<void> {
 	const run = activeRun;
 	if (!run) {
+		stopWatchdog();
+		return;
+	}
+	await hydrateKnownAsyncRuns(run, latestCtx?.sessionManager);
+	if (!activeRun) {
 		stopWatchdog();
 		return;
 	}
@@ -791,9 +1106,9 @@ ${template}`;
 
 function buildRunSystemPrompt(run: ActiveRun): string {
 	const phaseInstruction = run.awaitingVerification
-		? `The latest worker subagent attempt has completed. You must verify the workspace and evidence now.`
+		? `The latest worker subagent attempt from this Goal-Driven session tree has completed. You must verify the workspace and evidence now.`
 		: run.activeAsyncId
-			? `Worker subagent attempt #${run.attempt} is still running in background (async id: ${run.activeAsyncId}). Do not verify yet. Wait for the completion notification before acting again.`
+			? `Worker subagent attempt #${run.attempt} is still running in background inside this Goal-Driven session tree (async id: ${run.activeAsyncId}). Do not verify yet. Wait for the completion notification from this session tree before acting again.`
 			: `Launch exactly one worker subagent attempt to continue the run.`;
 
 	return `You are inside an active /${WORK_COMMAND_NAME} Goal-Driven run.
@@ -803,7 +1118,8 @@ You are the master agent. The worker subagent does implementation work, but the 
 Current run state:
 - Attempt count so far: ${run.attempt}
 - Phase: ${run.phase}
-- Active async worker id: ${run.activeAsyncId ?? "none"}
+- Active async worker id in this session tree: ${run.activeAsyncId ?? "none"}
+- Session scope: only background workers that belong to this Goal-Driven session tree count for waiting, recovery, blocking, or verification decisions
 - Goal:
 ${run.goal || "(see saved prompt in conversation)"}
 - Criteria for Success:
@@ -816,15 +1132,17 @@ Rules:
 - Do not invent alternate agent names or use descriptive labels in place of the actual agent name.
 - Every worker subagent call must run in background with async: true and clarify: false.
 - An async launch result only means the worker started. It is NOT proof that the task finished.
-- While a worker subagent is running in background, do not verify and do not launch another worker.
-- After a worker completion notification arrives, the master agent must verify the result itself against the Criteria for Success.
+- While a worker subagent is running in background inside this session tree, do not verify and do not launch another worker.
+- Ignore background workers that belong to other sessions, projects, or unrelated session trees.
+- If you inspect worker status, treat the filtered session-scoped "subagent_status list" result as the source of truth.
+- After a worker completion notification from this session tree arrives, the master agent must verify the result itself against the Criteria for Success.
 - Treat any unmet or unproven criterion as NOT met.
 - Before ending a message after a worker completion, do exactly one of these:
   1. If all criteria are fully satisfied and proven, include the exact line:
      ${MASTER_MET_VERDICT}
      Then summarize the evidence and do not call subagent again.
   2. If any criterion is unmet or unproven, create exactly one new worker subagent call to continue the work before ending the message.
-- After launching a background worker, end the message and wait for completion. Do not verify immediately after launch.
+- After launching a background worker, end the message and wait for completion from this session tree. Do not verify immediately after launch.
 - Do not stop early because the result looks "mostly done".
 - Do not end a verification message without either launching one new worker subagent or emitting ${MASTER_MET_VERDICT}.
 
@@ -835,9 +1153,10 @@ ${phaseInstruction}`;
 function buildVerificationReminder(run: ActiveRun): string {
 	return [
 		`Master verification is still required for the active Goal-Driven run.`,
+		`Only workers from this Goal-Driven session tree count when deciding whether to wait, recover, or relaunch. Ignore global async noise from other sessions or projects.`,
 		`Goal:\n${run.goal || "(see saved prompt above)"}`,
 		`Criteria for Success:\n${run.criteria || "(see saved prompt above)"}`,
-		`Use the latest completed worker subagent result already present in the conversation.`,
+		`Use the latest completed worker subagent result from this session tree already present in the conversation.`,
 		`Before ending your next message, do exactly one of the following:`,
 		`1. If every criterion is fully satisfied and proven, output the exact line: ${MASTER_MET_VERDICT}`,
 		`2. Otherwise create exactly one new worker subagent call with agent: "worker", async: true, and clarify: false to continue the work.`,
@@ -886,8 +1205,11 @@ async function runSavedPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 	}
 
 	const parsed = parsePromptSections(savedPrompt);
+	const sessionRef = getSessionRef(ctx);
 	activeRun = {
 		cwd: ctx.cwd,
+		sessionId: sessionRef.sessionId,
+		sessionFile: sessionRef.sessionFile,
 		goal: parsed.goal,
 		criteria: parsed.criteria,
 		attempt: 0,
@@ -902,6 +1224,7 @@ async function runSavedPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 		knownAsyncRuns: [],
 		lastEvent: "Launching master/subagent run",
 	};
+	await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
 	refreshStatus();
 	ensureWatchdog(pi);
 
@@ -925,7 +1248,9 @@ async function stopActiveFlow(ctx: ExtensionCommandContext): Promise<void> {
 	const hadBrainstorm = Boolean(activeBrainstorm);
 	const runToStop = activeRun;
 	const hadRun = Boolean(runToStop);
-	const stoppedWorkers = runToStop ? await stopKnownAsyncRuns(runToStop) : 0;
+	const cleanupSummary = runToStop
+		? await stopSessionScopedAsyncRuns(runToStop.sessionFile, runToStop.knownAsyncRuns, "Stopped by /goal-driven stop")
+		: summarizeAsyncRunCleanup([]);
 	clearBrainstorm();
 	clearRun();
 	if (!ctx.isIdle()) ctx.abort();
@@ -934,8 +1259,8 @@ async function stopActiveFlow(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 	ctx.ui.notify(
-		stoppedWorkers > 0
-			? `Stopped the active Goal-Driven flow and sent SIGTERM to ${stoppedWorkers} background ${pluralize(stoppedWorkers, "worker")}.`
+		cleanupSummary.stopped > 0 || cleanupSummary.alreadyFinished > 0 || cleanupSummary.missing > 0 || cleanupSummary.errors > 0
+			? `Stopped the active Goal-Driven flow; ${formatAsyncRunCleanupSummary(cleanupSummary)} across this session tree.`
 			: "Stopped the active Goal-Driven flow.",
 		"info",
 	);
@@ -944,6 +1269,9 @@ async function stopActiveFlow(ctx: ExtensionCommandContext): Promise<void> {
 export default function goalDriven(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		if (activeRun) {
+			await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
+		}
 		refreshStatus();
 	});
 
@@ -967,9 +1295,10 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!activeRun || event.toolName !== "subagent") return;
 		if (!isSubagentExecutionInput(event.input)) return;
+		await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
 
 		const runningKnownRun = await findRunningKnownAsyncRun(activeRun);
 		if (runningKnownRun) {
@@ -994,10 +1323,25 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		refreshStatus();
 	});
 
-	pi.on("tool_result", async (event, _ctx) => {
+	pi.on("tool_result", async (event, ctx) => {
+		if (activeRun && event.toolName === "subagent_status" && isSubagentStatusListInput(event.input)) {
+			await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
+			const runs = await listSessionScopedActiveAsyncRuns(activeRun.sessionFile, activeRun.knownAsyncRuns);
+			return {
+				content: [{ type: "text", text: formatScopedSubagentStatusList(runs) }],
+				details: {
+					mode: "single",
+					results: [],
+					scoped: true,
+					count: runs.length,
+				},
+			};
+		}
+
 		if (!activeRun || event.toolName !== "subagent") return;
 		if (!isSubagentExecutionInput(event.input)) return;
 		const launch = getSubagentAsyncLaunch(event.details);
+		await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
 		if (!launch.asyncId) {
 			activeRun.phase = "working";
 			activeRun.awaitingVerification = false;
@@ -1013,6 +1357,13 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			return;
 		}
 		trackKnownAsyncRun(activeRun, launch.asyncId, launch.asyncDir);
+		pi.appendEntry<GoalDrivenAsyncRunEntry>(GOAL_DRIVEN_ASYNC_RUN_ENTRY, {
+			sessionId: activeRun.sessionId,
+			sessionFile: activeRun.sessionFile,
+			asyncId: launch.asyncId,
+			asyncDir: launch.asyncDir,
+			cwd: activeRun.cwd,
+		});
 		activeRun.phase = "working";
 		activeRun.awaitingVerification = false;
 		activeRun.verificationReminderSent = false;
@@ -1023,8 +1374,9 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		ensureWatchdog(pi);
 	});
 
-	pi.events.on("subagent:complete", (data: unknown) => {
+	pi.events.on("subagent:complete", async (data: unknown) => {
 		if (!activeRun) return;
+		await hydrateKnownAsyncRuns(activeRun, latestCtx?.sessionManager);
 		const result = data as { id?: string; success?: boolean; asyncDir?: string; summary?: string };
 		if (!result.id) return;
 		const matchesActive = result.id === activeRun.activeAsyncId;
@@ -1100,6 +1452,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		}
 
 		if (!activeRun) return;
+		await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
 
 		if (hasMetVerdict(text)) {
 			const completedRun = activeRun;
@@ -1211,3 +1564,15 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		},
 	});
 }
+
+export const __goalDrivenTestUtils = {
+	GOAL_DRIVEN_WORKER_TASK_GUARD,
+	prependWorkerTaskGuard,
+	collectPersistedKnownAsyncRuns,
+	matchesSessionRef,
+	getSessionTreeRoot,
+	formatAsyncRunCleanupSummary,
+	formatScopedSubagentStatusList,
+	buildRunSystemPrompt,
+	buildVerificationReminder,
+};

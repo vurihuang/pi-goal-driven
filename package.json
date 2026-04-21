@@ -1,6 +1,6 @@
 {
   "name": "pi-goal-driven",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Goal-Driven template workflow for pi",
   "type": "module",
   "repository": {
@@ -38,6 +38,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "node --test",
     "pack:check": "npm pack --dry-run"
   },
   "publishConfig": {

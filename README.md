@@ -9,7 +9,7 @@ A minimal Pi extension for running a Goal-Driven master/worker workflow from a r
 ## Version notes
 
 - Previous version on `origin/master`: `0.2.0`
-- Current version in this codebase: `0.4.0`
+- Current version in this codebase: `0.4.1`
 - Detailed release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## What it does
@@ -71,13 +71,15 @@ This is the execution step.
 
 The prompt that gets sent is your filled Goal-Driven template, so Pi can run the master-agent behavior directly in the current conversation.
 
-In `0.4.0`, worker execution is aligned to `pi-subagents` background execution:
+In `0.4.1`, worker execution is aligned to `pi-subagents` background execution:
 
 - worker `subagent` calls are forced to `async: true`
 - worker `subagent` calls are forced to `clarify: false`
+- worker tasks are prefixed with a guard that forbids nested `subagent` launches and `/goal-driven` re-entry inside the worker session
 - the master agent does **not** verify immediately after async launch
 - verification starts only after the worker completion event arrives
-- while one worker is still running, additional worker launches are blocked
+- while one worker is still running in the current Goal-Driven session tree, additional worker launches are blocked
+- `subagent_status list` is filtered to the current Goal-Driven session tree instead of showing global async noise from other sessions or projects
 - the lower `Async subagents` panel is expected to come from `pi-subagents`
 
 If `pi-subagents` is not installed or enabled, the prompt can still be sent, but async orchestration will not behave as intended.
@@ -87,6 +89,13 @@ If `pi-subagents` is not installed or enabled, the prompt can still be sent, but
 Stops the active Goal-Driven flow.
 
 This applies to both active brainstorm flows and active `/goal-driven:work` runs.
+
+For active `/goal-driven:work` runs, stop is session-tree scoped:
+
+- it stops the current Goal-Driven run in memory
+- it sends SIGTERM to running workers owned by the current Goal-Driven session tree
+- it also cleans up nested async workers discovered under that same session tree
+- its completion message summarizes what happened, for example: stopped running workers, already-finished workers, missing runs, or cleanup errors
 
 ## Template file
 
@@ -144,6 +153,12 @@ The current recommended usage is:
 5. Watch the lower `Async subagents` panel for progress
 6. Wait for the master to verify results after worker completion
 7. If the criteria are still not met, the master launches another background worker attempt automatically
+
+Important runtime note:
+
+- the master only treats workers from the current Goal-Driven session tree as relevant
+- other async runs from unrelated sessions or projects are ignored for waiting, blocking, recovery, and verification decisions
+- when the master checks worker status, the session-scoped `subagent_status list` view is the source of truth
 
 In short:
 
@@ -310,7 +325,9 @@ This is one of the biggest architectural differences.
 
 - keeps the master workflow in the current Pi session
 - saves the filled prompt per workspace
-- tracks async worker runs
+- tracks async worker runs per Goal-Driven session
+- restores session-owned worker knowledge from persisted session entries
+- filters worker status to the current Goal-Driven session tree
 - relies on master-side verification plus watchdog logic for inactive workers
 
 #### `ralph`
@@ -357,7 +374,9 @@ That leads to different strengths:
 
 - forcing worker `subagent` calls to `async: true`
 - forcing worker `subagent` calls to `clarify: false`
-- blocking additional worker launches while one worker is still active
+- injecting a worker guard that forbids nested `subagent` launches inside worker sessions
+- blocking additional worker launches while one worker in the same Goal-Driven session tree is still active
+- filtering status checks to the current Goal-Driven session tree instead of the global async run pool
 - using an inactivity watchdog to stop and replace stale workers
 
 `ralph` currently includes repo-loop behavior such as:
