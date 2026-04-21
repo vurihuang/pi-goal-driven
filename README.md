@@ -2,218 +2,413 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-goal-driven)](https://www.npmjs.com/package/pi-goal-driven)
 [![npm downloads](https://img.shields.io/npm/dm/pi-goal-driven)](https://www.npmjs.com/package/pi-goal-driven)
-[![license](https://img.shields.io/badge/license-MIT-green.svg)](https://www.npmjs.com/package/pi-goal-driven)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](https://img.shields.io/badge/license-MIT-green.svg)
 
-## Showcase
+A minimal Pi extension for running a Goal-Driven master/worker workflow from a reusable template, with worker execution aligned to the `pi-subagents` async runtime.
 
-<table>
-  <tr>
-    <td><img src="https://raw.githubusercontent.com/vurihuang/pi-goal-driven/master/showcase-1.png" alt="Goal-Driven inline experiment dashboard" width="420" /></td>
-    <td><img src="https://raw.githubusercontent.com/vurihuang/pi-goal-driven/master/showcase-2.png" alt="Goal-Driven fullscreen experiment dashboard" width="420" /></td>
-  </tr>
-</table>
+## Version notes
 
-A Pi package that turns the [Goal-Driven](https://github.com/lidangzzz/goal-driven) master/subagent pattern into a Pi-native extension.
+- Previous version on `origin/master`: `0.2.0`
+- Current version in this codebase: `0.4.0`
+- Detailed release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
-Special thanks to [lidangzzz/goal-driven](https://github.com/lidangzzz/goal-driven) — it's a great project and the direct inspiration for this package.
+## What it does
 
-Also inspired by [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).
+This package provides three focused commands:
 
-Instead of pasting the long prompt by hand, the package gives you a `/goal-driven` command with a Pi-native setup flow.
+1. `/goal-driven` collects **Goal** and **Criteria for Success** with Pi's native UI dialogs
+2. `/goal-driven:brainstorm` refines the same template through normal chat
+3. `/goal-driven:work` executes the saved Goal-Driven run in the current session
 
-It also provides `/goal-driven:brainstorm`, which acts like a lightweight `ce:brainstorm`-style front door for Goal-Driven: it helps you refine the Goal and Criteria for success through normal chat, asks follow-up questions only when needed, asks for confirmation, then automatically starts the supervised Goal-Driven run without copy-pasting.
-
-The standard `/goal-driven` flow lets you:
-
-- use the configured `pi-subagents` worker profile
-- enter the `Goal`
-- enter the `Criteria for success`
-
-Then it starts a supervised loop:
-
-1. launch one working subagent through `pi-subagents`
-2. watch it for inactivity
-3. verify progress against the success criteria
-4. restart the subagent if the criteria are still not met
-5. stop only when the verifier says the goal is met, or when you manually stop the run
-
-## Prerequisite
-
-You must already have the global [`pi-subagents`](https://github.com/nicobailon/pi-subagents) Pi extension installed and enabled before using this plugin.
-
-A normal package install via `pi install npm:pi-subagents` is enough. `pi-goal-driven` now accepts either:
-
-- an extracted extension file at `~/.pi/agent/extensions/pi-subagents/index.ts`, or
-- a `pi-subagents` package entry in `~/.pi/agent/settings.json`
-
-```bash
-pi install npm:pi-subagents
-```
-
-`pi-goal-driven` now relies on that global `pi-subagents` extension for worker runs instead of injecting its own bundled extension copy.
-
-## Install
-
-Recommended:
-
-```bash
-pi install npm:pi-goal-driven
-```
-
-Local development:
-
-```bash
-pi install /path/to/pi-goal-driven
-```
-
-Or load it directly for a single run:
-
-```bash
-pi -e /path/to/pi-goal-driven
-```
-
-This package uses `pi-subagents` internally for worker execution, but Goal-Driven worker sessions expect the global `pi-subagents` extension to be present.
-
-## Quick example
-
-After installing `pi-subagents` and `pi-goal-driven`, start Pi in the target repo and run:
-
-```text
-/goal-driven
-```
-
-Then fill in a goal and success criteria such as:
-
-**Goal**
-
-```text
-Refactor the auth flow to remove duplicated token parsing logic and keep behavior unchanged.
-```
-
-**Criteria for success**
-
-```text
-1. Token parsing lives in one shared implementation.
-2. Existing auth routes still behave the same.
-3. `npx tsc --noEmit` passes.
-4. `npx eslint . --quiet` passes.
-```
-
-Useful commands:
-
-```text
-/goal-driven
-/goal-driven brainstorm
-/goal-driven:brainstorm
-/goal-driven status
-/goal-driven stop
-```
-
-Typical flow:
-
-1. run `/goal-driven`
-2. enter the goal
-3. enter the criteria for success
-4. let the worker run and the verifier check progress automatically
-5. use `/goal-driven status` to inspect the latest run
-6. use `/goal-driven stop` if you want to stop supervision manually
+The long prompt lives in `goal-driven-template.md` instead of being embedded directly in a large hardcoded string.
 
 ## Commands
 
 ### `/goal-driven`
 
-Starts a new Goal-Driven run.
+Starts a local overlay wizard.
 
-The command prompts for:
+The extension opens a 3-step flow:
 
-- Goal
-- Criteria for success
+- `Goal`
+- `Criteria for Success`
+- `Review`
 
-It uses the worker configured in `pi-goal-driven` config, and uses either:
+The wizard fills `goal-driven-template.md` locally, lets you review the final prompt in-place, and saves the completed prompt for the current workspace.
 
-- the configured `provider` and `model` from `pi-goal-driven` config, or
-- your current Pi session model when no config model is set
+If rich overlay UI is unavailable, it falls back to native Pi editors.
 
-While the loop is running, every worker cycle is shown as an **experiment** in the UI:
+When the filled prompt is ready, run:
 
-- compact widget above the editor in an autoresearch-style single-line format
-- counts for runs, met, retry, failed, and inactive experiments
-- per-experiment duration and description-like summaries
-- `Ctrl+X` toggles the inline experiment dashboard
-- `Ctrl+Shift+X` opens a fullscreen scrollable dashboard
-- the latest run snapshot is persisted, so you can still inspect the experiment history after restarting Pi
+```text
+/goal-driven:work
+```
 
 ### `/goal-driven:brainstorm`
 
-Starts an interactive brainstorming pass for Goal-Driven.
+Starts a chat-based refinement flow for the same template.
 
-You can pass the task inline:
+Use it when the task is still fuzzy and you want Pi to help shape the final prompt before execution.
 
-```text
-/goal-driven:brainstorm Build an Open Agents-style submodule inside the current app
-```
-
-Or run it without arguments and fill the prompt in the editor.
-
-The brainstorm flow will:
-
-- inspect the repo as needed
-- ask follow-up questions only when they materially improve scope or success criteria
-- draft a refined `Goal`
-- draft strict `Criteria for success`
-- ask you to confirm, explicitly telling you that `ok` will immediately launch Goal-Driven
-- automatically launch `/goal-driven` with the confirmed Goal + Criteria
-
-This avoids manually copying brainstorm output into the Goal-Driven dialog.
-
-You can also launch the same flow as a subcommand:
+Examples:
 
 ```text
-/goal-driven brainstorm
+/goal-driven:brainstorm
+/goal-driven:brainstorm Rebuild the issue detail page to match the multica reference exactly
 ```
 
-### `/goal-driven setup`
+When Pi has enough information, it returns a completed template prompt, the extension saves it, and you can run:
 
-Copies the default config to:
-
-```bash
-~/.pi/agent/extensions/pi-goal-driven/config.json
+```text
+/goal-driven:work
 ```
 
-This is the only supported config location.
+### `/goal-driven:work`
 
-Config example:
+Loads the latest saved prompt for the current workspace and sends it into the current session.
 
-```json
-{
-  "defaultAgent": "worker",
-  "provider": "openai",
-  "model": "gpt-5.4"
-}
-```
+This is the execution step.
 
-### `/goal-driven status`
+The prompt that gets sent is your filled Goal-Driven template, so Pi can run the master-agent behavior directly in the current conversation.
 
-Shows the current run status, including experiment counts, recent experiment summaries, and the per-run log directory.
+In `0.4.0`, worker execution is aligned to `pi-subagents` background execution:
 
-Each attempt now writes worker/verifier output under:
+- worker `subagent` calls are forced to `async: true`
+- worker `subagent` calls are forced to `clarify: false`
+- the master agent does **not** verify immediately after async launch
+- verification starts only after the worker completion event arrives
+- while one worker is still running, additional worker launches are blocked
+- the lower `Async subagents` panel is expected to come from `pi-subagents`
 
-```bash
-~/.pi/agent/extensions/pi-goal-driven/runs/
-```
-
-Inside each run directory you will find per-attempt `session/` and `artifacts/` directories for both worker and verifier.
+If `pi-subagents` is not installed or enabled, the prompt can still be sent, but async orchestration will not behave as intended.
 
 ### `/goal-driven stop`
 
-Stops the current Goal-Driven run and kills the active subprocess.
+Stops the active Goal-Driven flow.
 
-## Notes
+This applies to both active brainstorm flows and active `/goal-driven:work` runs.
 
-- The worker is executed with `pi-subagents`'s `runSync()` engine, not a custom raw `spawn()` loop.
-- The configured worker profile is wrapped with Goal-Driven-specific instructions and relies on your globally installed `pi-subagents` extension during worker runs.
-- `pi-subagents` is a hard prerequisite for this plugin. `/goal-driven` accepts either the extracted extension path or an installed `pi-subagents` package entry in `~/.pi/agent/settings.json`.
-- The verifier is read-only in practice: it gets inspection tools plus `bash` for checks, but no edit/write tools.
-- The extension keeps a short history of recent failed attempts and feeds that back into the next worker attempt.
-- `/goal-driven:brainstorm` temporarily injects a brainstorm-specific system prompt only while that brainstorm is active, then hands off the confirmed Goal and Criteria directly into the supervised run.
-- The package only activates when you explicitly run `/goal-driven` or `/goal-driven:brainstorm`, so it does not constantly inject the Goal-Driven prompt into normal Pi conversations.
+## Template file
+
+The canonical template lives in:
+
+```text
+goal-driven-template.md
+```
+
+That file is published with the package and read at runtime.
+
+## Saved prompts
+
+Filled prompts are stored under:
+
+```text
+~/.pi/agent/extensions/pi-goal-driven/prompts/<workspace>/latest-prompt.md
+```
+
+Each workspace keeps its own latest saved prompt.
+
+## Requirements
+
+- Pi
+- `pi-subagents` installed and enabled
+  - provides the `subagent` tool
+  - provides background execution support
+  - provides the lower `Async subagents` widget
+  - provides the `subagent:complete` lifecycle used by `/goal-driven:work`
+
+## Install
+
+```bash
+pi install npm:pi-subagents
+pi install npm:pi-goal-driven
+```
+
+For local development:
+
+```bash
+pi install /path/to/pi-subagents
+pi install /path/to/pi-goal-driven
+```
+
+## Recommended usage
+
+The current recommended usage is:
+
+1. Define a concrete **Goal** and strict **Criteria for Success**
+2. Save the Goal-Driven prompt with either:
+   - `/goal-driven` for a direct wizard flow
+   - `/goal-driven:brainstorm ...` for a chat-shaped planning flow
+3. Run `/goal-driven:work`
+4. Let the worker run through `pi-subagents` in background
+5. Watch the lower `Async subagents` panel for progress
+6. Wait for the master to verify results after worker completion
+7. If the criteria are still not met, the master launches another background worker attempt automatically
+
+In short:
+
+- use `/goal-driven` when you already know the task and checks
+- use `/goal-driven:brainstorm` when the task is still fuzzy
+- use `/goal-driven:work` only after the prompt is saved and ready
+
+## Examples
+
+### Example 1: simple
+
+Use this when the task is small, concrete, and already well-specified.
+
+```text
+/goal-driven
+```
+
+Then fill the wizard with something like:
+
+**Goal**
+
+```text
+Create a script that reads all CSV files under data/ and writes leaderboard.txt with totals per user.
+```
+
+**Criteria for Success**
+
+```text
+1. Running `python3 build_leaderboard.py` exits successfully.
+2. `leaderboard.txt` is created in the project root.
+3. The output is sorted by total score descending.
+4. Only `.csv` files are processed.
+5. The master agent verifies the output after worker completion.
+```
+
+Then execute:
+
+```text
+/goal-driven:work
+```
+
+What happens next:
+
+- the worker starts in background via `pi-subagents`
+- the lower `Async subagents` panel shows progress
+- when the worker finishes, the master verifies the criteria
+- if anything is still missing, another worker attempt is launched automatically
+
+### Example 2: complex
+
+Use this when the task needs clarification, scoping, or stronger acceptance criteria before execution.
+
+```text
+/goal-driven:brainstorm Rebuild the issue detail page to match the latest design exactly, preserve existing data behavior, and verify the final UI against the acceptance criteria before stopping.
+```
+
+Typical result of the brainstorm phase:
+
+- Pi asks for missing constraints if needed
+- Pi drafts a complete Goal-Driven prompt
+- the prompt is saved for the current workspace
+
+Then execute:
+
+```text
+/goal-driven:work
+```
+
+A good complex run usually includes criteria like:
+
+```text
+1. The issue detail page layout matches the target design in structure and spacing.
+2. Existing data loading and issue actions still work.
+3. Typecheck passes.
+4. The master agent verifies the implemented result after worker completion.
+5. The run only stops when every criterion is proven.
+```
+
+## Design goal
+
+Keep the package thin.
+
+- Template in a file
+- Prompt generation in the current session
+- Execution in the current session
+- Worker runtime delegated to `pi-subagents`
+- Async progress UI delegated to `pi-subagents`
+- No ask-user extension dependency
+- No embedded subagent runtime in this package
+
+## Comparison with `snarktank/ralph`
+
+Both projects aim to make long-running AI-assisted work more reliable, but they solve different layers of the problem.
+
+### High-level positioning
+
+- **`pi-goal-driven`** is a **Pi-native extension**.
+  - It stays inside the current Pi session.
+  - It collects a Goal and Criteria for Success.
+  - It lets a master agent coordinate background worker attempts through `pi-subagents`.
+- **[`snarktank/ralph`](https://github.com/snarktank/ralph)** is a **repository-level autonomous loop**.
+  - It runs as a shell script.
+  - It repeatedly launches fresh Amp or Claude Code sessions.
+  - It advances work story by story from a structured `prd.json` backlog.
+
+### Core execution model
+
+| Dimension | `pi-goal-driven` | `ralph` |
+|---|---|---|
+| Main runtime | Pi extension command flow | Bash loop (`ralph.sh`) |
+| Agent topology | 1 master agent + 1 background worker at a time | Repeated fresh single-agent iterations |
+| Execution boundary | Inside the current Pi conversation | Outside the chat, via repeated CLI invocations |
+| Retry model | Master verifies after worker completion, then relaunches if criteria are not met | Loop picks next failing story and starts another clean iteration |
+| State continuity | Current session context + saved prompt + async run state | Fresh context every iteration, with persistence via git, `progress.txt`, and `prd.json` |
+| Progress UI | Delegated to Pi / `pi-subagents` async panel | CLI / git / files |
+
+### Planning input and task framing
+
+`pi-goal-driven` is centered around a **single goal-oriented prompt**:
+
+- the user defines one Goal
+- the user defines explicit Criteria for Success
+- the extension fills `goal-driven-template.md`
+- `/goal-driven:work` executes that saved prompt
+
+`ralph` is centered around a **task backlog**:
+
+- a PRD is created first
+- the PRD is converted into `prd.json`
+- work is broken into multiple user stories
+- each story is tracked with `passes: true/false`
+- the loop completes the highest-priority unfinished story each iteration
+
+So the practical difference is:
+
+- **`pi-goal-driven`** is optimized for **goal verification**
+- **`ralph`** is optimized for **backlog traversal across many small stories**
+
+### Dependency model
+
+`pi-goal-driven` deliberately stays thin and depends on Pi capabilities:
+
+- Pi
+- `pi-subagents`
+- Pi UI/editor/runtime features
+
+`ralph` is more toolchain-oriented and depends on external CLI setup:
+
+- Amp or Claude Code
+- `jq`
+- git repository workflow
+- prompt files and optional skills installation
+
+This means:
+
+- `pi-goal-driven` fits best when your team is already committed to the **Pi extension ecosystem**
+- `ralph` fits best when you want a **portable repo script** that can run across projects with minimal framework coupling beyond the chosen coding CLI
+
+### Memory and continuity strategy
+
+This is one of the biggest architectural differences.
+
+#### `pi-goal-driven`
+
+- keeps the master workflow in the current Pi session
+- saves the filled prompt per workspace
+- tracks async worker runs
+- relies on master-side verification plus watchdog logic for inactive workers
+
+#### `ralph`
+
+- intentionally starts each iteration with fresh context
+- treats context reset as a feature, not a bug
+- preserves continuity through:
+  - commit history
+  - `progress.txt`
+  - `prd.json`
+  - optional AGENTS.md updates
+
+In short:
+
+- choose **`pi-goal-driven`** when maintaining a **continuous supervisory session** is useful
+- choose **`ralph`** when you want **hard context resets between iterations** to reduce drift and prompt bloat
+
+### Verification philosophy
+
+`pi-goal-driven` emphasizes a **master verifies after worker completion** pattern:
+
+- worker runs in background
+- master waits for completion event
+- master checks Criteria for Success
+- master relaunches the worker if the result is still insufficient
+
+`ralph` emphasizes a **story-by-story shipping loop**:
+
+- implement one story
+- run quality checks
+- commit passing work
+- mark the story complete in `prd.json`
+- append learnings to `progress.txt`
+- continue until all stories pass
+
+That leads to different strengths:
+
+- **`pi-goal-driven`** is stronger when success is best expressed as a **single end-state contract**
+- **`ralph`** is stronger when success is best expressed as a **sequence of small independently shippable units**
+
+### Operational behavior
+
+`pi-goal-driven` currently includes Pi-specific operational behavior such as:
+
+- forcing worker `subagent` calls to `async: true`
+- forcing worker `subagent` calls to `clarify: false`
+- blocking additional worker launches while one worker is still active
+- using an inactivity watchdog to stop and replace stale workers
+
+`ralph` currently includes repo-loop behavior such as:
+
+- feature-branch tracking from `prd.json`
+- run archiving when branch context changes
+- support for both Amp and Claude Code
+- optional PRD/skill workflow for generating structured backlog input
+
+So `pi-goal-driven` is closer to **runtime orchestration inside an agent platform**, while `ralph` is closer to **automation glue around coding agents**.
+
+### Ergonomics
+
+#### `pi-goal-driven`
+
+Best when you want:
+
+- native Pi commands like `/goal-driven`, `/goal-driven:brainstorm`, `/goal-driven:work`
+- a lightweight setup
+- quick transition from fuzzy task → explicit goal → execution
+- built-in awareness of Pi async workers
+
+#### `ralph`
+
+Best when you want:
+
+- a scriptable repo workflow
+- explicit PRD-driven decomposition
+- durable iteration logs in files committed with the project
+- a model where each new run starts from a clean agent context
+
+### Trade-offs at a glance
+
+| If you care most about... | Better fit |
+|---|---|
+| Pi-native UX and extension integration | `pi-goal-driven` |
+| Fresh-agent iterations with durable file-based memory | `ralph` |
+| A single goal with strict success criteria | `pi-goal-driven` |
+| Multi-story execution from a PRD backlog | `ralph` |
+| Async worker supervision inside one ongoing session | `pi-goal-driven` |
+| Portable shell-based orchestration across repos | `ralph` |
+
+### Bottom line
+
+The two projects are not direct clones of each other.
+
+- `pi-goal-driven` packages the **Goal-Driven master/worker pattern** as a thin Pi extension.
+- `ralph` packages an **autonomous iteration loop** as a repo-level script plus PRD workflow.
+
+If your preferred operating model is **"stay inside Pi, supervise one goal until verified"**, `pi-goal-driven` is the more natural fit.
+
+If your preferred operating model is **"translate a PRD into many small stories and let fresh agent runs chip away at them one by one"**, `ralph` is the more natural fit.
+
+They are complementary ideas with different centers of gravity: **Pi-native supervised execution** vs. **repo-native autonomous iteration**.

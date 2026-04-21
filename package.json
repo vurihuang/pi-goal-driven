@@ -1,7 +1,7 @@
 {
   "name": "pi-goal-driven",
-  "version": "0.2.0",
-  "description": "Goal-Driven master/subagent supervisor for pi",
+  "version": "0.4.0",
+  "description": "Goal-Driven template workflow for pi",
   "type": "module",
   "repository": {
     "type": "git",
@@ -30,8 +30,9 @@
   },
   "files": [
     "index.ts",
-    "config.json",
+    "goal-driven-template.md",
     "README.md",
+    "CHANGELOG.md",
     "showcase-1.png",
     "showcase-2.png"
   ],
@@ -49,8 +50,5 @@
     "@mariozechner/pi-coding-agent": "^0.67.2",
     "@types/node": "^24.3.0",
     "typescript": "^5.7.3"
-  },
-  "dependencies": {
-    "pi-subagents": "^0.14.1"
   }
 }

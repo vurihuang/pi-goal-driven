@@ -1,1147 +1,86 @@
-import { randomUUID } from "node:crypto";
-import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { discoverAgents, type AgentConfig } from "pi-subagents/agents.ts";
-import { runSync } from "pi-subagents/execution.ts";
-import type { Details, SingleResult, Usage } from "pi-subagents/types.ts";
-import { getSingleResultOutput } from "pi-subagents/utils.ts";
+import {
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type Theme,
+} from "@mariozechner/pi-coding-agent";
+import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 
 const EXTENSION_NAME = "pi-goal-driven";
 const COMMAND_NAME = "goal-driven";
 const BRAINSTORM_COMMAND_NAME = `${COMMAND_NAME}:brainstorm`;
-const DEFAULT_AGENT_NAME = "worker";
-const INACTIVITY_CHECK_MS = 30_000;
-const INACTIVITY_WINDOW_MS = 5 * 60_000;
-const STATUS_REFRESH_MS = 1_000;
-const HISTORY_LIMIT = 3;
-const DASHBOARD_MAX_ROWS = 6;
-const SNIPPET_LIMIT = 1_800;
-const VERIFIER_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const OVERLAY_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const WORK_COMMAND_NAME = `${COMMAND_NAME}:work`;
+const PROMPT_START = "GOAL_DRIVEN_PROMPT_START";
+const PROMPT_END = "GOAL_DRIVEN_PROMPT_END";
+const GOAL_PLACEHOLDER = "[[[[[DEFINE YOUR GOAL HERE]]]]]";
+const CRITERIA_PLACEHOLDER = "[[[[[DEFINE YOUR CRITERIA FOR SUCCESS HERE]]]]]";
+const PLACEHOLDER_TOKEN = "[[[[[";
+const MASTER_MET_VERDICT = "GOAL_DRIVEN_VERDICT: MET";
+const GOAL_DRIVEN_WORKER_AGENT = "worker";
+const WATCHDOG_POLL_MS = 15_000;
+const WATCHDOG_INACTIVE_TIMEOUT_MS = 15 * 60 * 1000;
+const WATCHDOG_STOP_REASON = "Stopped by Goal-Driven inactivity watchdog";
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const BUNDLED_CONFIG_PATH = path.join(PACKAGE_DIR, "config.json");
-const GLOBAL_AGENT_DIR = getAgentDir();
-const GLOBAL_EXTENSION_DIR = path.join(GLOBAL_AGENT_DIR, "extensions", EXTENSION_NAME);
-const GLOBAL_CONFIG_PATH = path.join(GLOBAL_EXTENSION_DIR, "config.json");
-const GLOBAL_RUNS_DIR = path.join(GLOBAL_EXTENSION_DIR, "runs");
-const GLOBAL_BRAINSTORMS_DIR = path.join(GLOBAL_EXTENSION_DIR, "brainstorms");
-const GLOBAL_SETTINGS_PATH = path.join(GLOBAL_AGENT_DIR, "settings.json");
-const GLOBAL_SUBAGENTS_EXTENSION_PATH = path.join(GLOBAL_AGENT_DIR, "extensions", "pi-subagents", "index.ts");
+const TEMPLATE_PATH = path.join(PACKAGE_DIR, "goal-driven-template.md");
+const GLOBAL_EXTENSION_DIR = path.join(getAgentDir(), "extensions", EXTENSION_NAME);
+const GLOBAL_PROMPTS_DIR = path.join(GLOBAL_EXTENSION_DIR, "prompts");
 
-const PROMPT_TEMPLATE = `# Goal-Driven(1 master agent + 1 subagent) System
+const USAGE_TEXT = [
+	`/${COMMAND_NAME}`,
+	`/${BRAINSTORM_COMMAND_NAME} [task]`,
+	`/${WORK_COMMAND_NAME}`,
+	`/${COMMAND_NAME} stop`,
+].join(", ");
 
-Here we define a goal-driven multi-agent system for solving any problem.
+type RunPhase = "working" | "verifying";
+type AsyncRunState = "queued" | "running" | "complete" | "failed";
 
-Goal: [[[[[DEFINE_GOAL_HERE]]]]]
-
-Criteria for success: [[[[[DEFINE_SUCCESS_CRITERIA_HERE]]]]]
-
-Here is the System: The system contains a master agent and a subagent. You are the master agent, and you need to create 1 subagent to help you complete the task.
-
-## Subagent's description:
-
-The subagent's goal is to complete the task assigned by the master agent. The goal defined above is the final and the only goal for the subagent. The subagent should have the ability to break down the task into smaller sub-tasks, and assign the sub-tasks to itself or other subagents if necessary. The subagent should also have the ability to monitor the progress of each sub-task and update the master agent accordingly. The subagent should continue to work on the task until the criteria for success are met.
-
-## Master agent's description:
-
-The master agent is responsible for overseeing the entire process and ensuring that the subagent is working towards the goal. The only 3 tasks that the main agent need to do are:
-
-1. Create subagents to complete the task.
-2. If the subagent finishes the task successfully or fails to complete the task, the master agent should evaluate the result by checking the criteria for success. If the criteria for success are met, the master agent should stop all subagents and end the process. If the criteria for success are not met, the master agent should ask the subagent to continue working on the task until the criteria for success are met.
-3. The master agent should check the activities of each subagent for every 5 minutes, and if the subagent is inactive, please check if the current goal is reached and verify the status. If the goal is not reached, restart a new subagent with the same name to replace the inactive subagent. The new subagent should continue to work on the task and update the master agent accordingly.
-4. This process should continue until the criteria for success are met. DO NOT STOP THE AGENTS UNTIL THE USER STOPS THEM MANUALLY FROM OUTSIDE.
-
-## Basic design of the goal-driven double agent system in pseudocode:
-
-create a subagent to complete the goal
-
-while (criteria are not met) {
-  check the activty of the subagent every 5 minutes
-  if (the subagent is inactive or declares that it has reached the goal) {
-    check if the current goal is reached and verify the status
-    if (criteria are not met) {
-      restart a new subagent with the same name to replace the inactive subagent
-    }
-    else {
-      stop all subagents and end the process
-    }
-  }
-}`;
-
-const WORKER_SYSTEM_PROMPT = `You are the single Goal-Driven subagent.
-
-Your only final goal is to make the current workspace satisfy the goal and the criteria you are given.
-
-Rules:
-- Work directly in the current workspace.
-- Make concrete progress instead of discussing hypotheticals.
-- Break the work into smaller steps and execute them.
-- Run verification commands before claiming success whenever possible.
-- Do not ask the user questions.
-- When you decide to stop this attempt, your final response must end with this exact header block:
-GOAL_DRIVEN_STATUS: READY_FOR_VERIFICATION
-SUMMARY:
-- bullet points of what changed or what you verified
-OPEN_ISSUES:
-- bullet points of anything still failing or unknown (or '- none')`;
-
-const VERIFIER_SYSTEM_PROMPT = `You are the Goal-Driven master verifier.
-
-Your only job is to decide whether the goal is already met.
-
-Rules:
-- Never edit or write files.
-- You may inspect the workspace with read, grep, find, ls, and bash verification commands.
-- Be strict. If any criterion is unproven, the verdict must be NOT_MET.
-- Return exactly JSON, with no markdown fences and no prose before or after it.
-- JSON schema:
-{"verdict":"MET"|"NOT_MET","summary":"short explanation","nextActions":["action 1","action 2"]}`;
-
-const GOAL_DRIVEN_BRAINSTORM_SYSTEM_PROMPT = `You are in Goal-Driven brainstorm mode.
-
-Your job is to convert the user's abstract task into a high-quality Goal and Criteria for success for the /goal-driven workflow.
-
-Behavior:
-- Think like a concise ce:brainstorm facilitator.
-- Understand the request, inspect the repo when useful, and pressure-test scope lightly.
-- Ask at most one focused question at a time, and only when it materially improves the final Goal or Criteria.
-- If the task is already clear, skip extra questions and draft the Goal and Criteria immediately.
-- Do not implement code during this mode.
-- Keep implementation details out unless the task itself is architectural.
-- Use repo-relative paths when referencing files.
-- Keep responses concise.
-
-Drafting rules:
-- Produce a Goal that is narrow enough to execute well, but broad enough to capture the real user intent.
-- Produce Criteria for success that are observable, strict, and directly usable by a verifier.
-- Include verification commands when appropriate for the repo and task.
-- Prefer numbered criteria.
-
-Confirmation and handoff:
-- Before finalizing, show the proposed Goal and Criteria in normal prose and ask the user for explicit confirmation.
-- Use a short confirmation prompt such as: "If this looks right, reply 'ok' and I'll start Goal-Driven with it."
-- Never emit the final machine-readable block or any JSON protocol block to the user.
-- The user-facing confirmation response should stay human-readable only.`;
-
-type RunState = "running" | "verifying" | "stopping";
-type Verdict = "MET" | "NOT_MET";
-type AttemptStatus = "success" | "not_met" | "worker_failed" | "inactive";
-
-type ProgressUpdate = {
-	content?: Array<{ type?: string; text?: string }>;
-	details?: Details;
-};
-
-interface GoalDrivenConfig {
-	defaultAgent: string;
-	provider?: string;
-	model?: string;
-}
-
-interface RunModelConfig {
-	primary?: string;
-	exactTarget: boolean;
-}
-
-const DEFAULT_CONFIG: GoalDrivenConfig = {
-	defaultAgent: DEFAULT_AGENT_NAME,
-};
-
-interface SetupResult {
-	goal: string;
-	criteria: string;
-	agentName: string;
-	brainstormSummary?: string;
-}
-
-interface VerificationResult {
-	verdict: Verdict;
-	summary: string;
-	nextActions: string[];
-}
-
-interface AttemptRecord {
-	attempt: number;
-	status: AttemptStatus;
-	reason: string;
-	summary: string;
-	workerSummary: string;
-	verifierSummary: string;
-	nextActions: string[];
-	verdict: Verdict;
-	startedAt: number;
-	finishedAt: number;
-}
-
-interface ManagedSingleRun {
-	result: SingleResult;
-	killedForInactivity: boolean;
-}
-
-interface PersistedRunSnapshot {
-	goal: string;
-	criteria: string;
-	brainstormSummary?: string;
-	filledPrompt: string;
+interface ActiveBrainstorm {
 	cwd: string;
-	modelConfig: RunModelConfig;
-	thinkingLevel: string;
-	startedAt: number;
-	attempt: number;
-	attemptStartedAt: number;
-	state: RunState;
-	lastActivityAt: number;
 	lastEvent: string;
-	history: AttemptRecord[];
-	dashboardExpanded: boolean;
-	stopRequested: boolean;
-	stopReason?: string;
-	agentName: string;
-	debugDir: string;
-	lastWorkerSummary?: string;
-	lastFailureReason?: string;
-	lastVerifierSummary?: string;
-	archivedAt: number;
+	template: string;
+}
+
+interface KnownAsyncRun {
+	id: string;
+	dir: string | null;
+}
+
+interface AsyncRunSnapshot {
+	state: AsyncRunState | null;
+	lastUpdate: number | null;
+	pid: number | null;
+	outputFile: string | null;
 }
 
 interface ActiveRun {
-	goal: string;
-	criteria: string;
-	brainstormSummary?: string;
-	filledPrompt: string;
 	cwd: string;
-	modelConfig: RunModelConfig;
-	thinkingLevel: string;
-	startedAt: number;
-	attempt: number;
-	attemptStartedAt: number;
-	state: RunState;
-	lastActivityAt: number;
-	lastEvent: string;
-	history: AttemptRecord[];
-	dashboardExpanded: boolean;
-	stopRequested: boolean;
-	stopReason?: string;
-	currentAbort?: AbortController;
-	agentName: string;
-	debugDir: string;
-	lastWorkerSummary?: string;
-	lastFailureReason?: string;
-	lastVerifierSummary?: string;
-	statusTimer?: NodeJS.Timeout;
-}
-
-interface PreparedRunContext {
-	config: GoalDrivenConfig;
-	configPath: string;
-	selectedAgent: ReturnType<typeof selectConfiguredAgent>;
-}
-
-type BrainstormPhase = "starting" | "researching" | "drafting" | "awaiting-confirmation";
-
-interface BrainstormState {
-	agentName: string;
-	initialRequest: string;
-	startedAt: number;
-	prepared: PreparedRunContext;
-	thinkingLevel: string;
-	phase: BrainstormPhase;
-	lastEvent: string;
-	draftPath: string;
-	latestDraft?: BrainstormResult;
-}
-
-interface BrainstormResult {
 	goal: string;
 	criteria: string;
-	summary?: string;
+	attempt: number;
+	phase: RunPhase;
+	awaitingVerification: boolean;
+	verificationReminders: number;
+	verificationReminderSent: boolean;
+	activeAsyncId: string | null;
+	activeAsyncDir: string | null;
+	latestAsyncId: string | null;
+	latestAsyncDir: string | null;
+	knownAsyncRuns: KnownAsyncRun[];
+	lastEvent: string;
 }
 
-let activeRun: ActiveRun | null = null;
-let latestArchivedRun: ActiveRun | null = null;
 let latestCtx: ExtensionContext | null = null;
-let activeBrainstorm: BrainstormState | null = null;
-
-function emptyUsage(): Usage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-}
-
-function truncate(text: string, max = SNIPPET_LIMIT): string {
-	const normalized = text.trim();
-	if (normalized.length <= max) return normalized;
-	return `${normalized.slice(0, max - 1)}…`;
-}
-
-function singleLine(text: string, max = 100): string {
-	const normalized = text.replace(/\s+/g, " ").trim();
-	if (normalized.length <= max) return normalized;
-	return `${normalized.slice(0, max - 1)}…`;
-}
-
-function formatDuration(ms: number): string {
-	if (ms < 1_000) return "just now";
-	const seconds = Math.floor(ms / 1_000);
-	if (seconds < 60) return `${seconds}s ago`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m ago`;
-	const hours = Math.floor(minutes / 60);
-	return `${hours}h ago`;
-}
-
-function formatElapsed(ms: number): string {
-	const seconds = Math.max(0, Math.floor(ms / 1_000));
-	const minutes = Math.floor(seconds / 60);
-	const remainder = seconds % 60;
-	if (minutes === 0) return `${remainder}s`;
-	return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
-}
-
-function clamp(value: number, min: number, max: number): number {
-	return Math.min(Math.max(value, min), max);
-}
-
-function getTuiSize(tui: { terminal?: { columns?: number; rows?: number } }): { width: number; height: number } {
-	return {
-		width: tui.terminal?.columns ?? process.stdout.columns ?? 120,
-		height: tui.terminal?.rows ?? process.stdout.rows ?? 40,
-	};
-}
-
-async function ensureDir(dir: string): Promise<void> {
-	await mkdir(dir, { recursive: true });
-}
-
-function sanitizePathSegment(value: string): string {
-	const sanitized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-	return sanitized || "run";
-}
-
-function runsDirForCwd(cwd: string): string {
-	return path.join(GLOBAL_RUNS_DIR, sanitizePathSegment(cwd));
-}
-
-function latestRunSnapshotPathForCwd(cwd: string): string {
-	return path.join(runsDirForCwd(cwd), "latest-run.json");
-}
-
-function brainstormsDirForCwd(cwd: string): string {
-	return path.join(GLOBAL_BRAINSTORMS_DIR, sanitizePathSegment(cwd));
-}
-
-function brainstormDraftPath(cwd: string, startedAt: number): string {
-	return path.join(
-		brainstormsDirForCwd(cwd),
-		`${new Date(startedAt).toISOString().replace(/[:.]/g, "-")}-draft.json`,
-	);
-}
-
-async function createRunDebugDir(cwd: string): Promise<string> {
-	const dir = path.join(
-		runsDirForCwd(cwd),
-		`${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`,
-	);
-	await mkdir(dir, { recursive: true });
-	return dir;
-}
-
-function historyLogPath(run: { debugDir: string }): string {
-	return path.join(run.debugDir, "experiments.jsonl");
-}
-
-function toPersistedRunSnapshot(run: ActiveRun): PersistedRunSnapshot {
-	return {
-		goal: run.goal,
-		criteria: run.criteria,
-		brainstormSummary: run.brainstormSummary,
-		filledPrompt: run.filledPrompt,
-		cwd: run.cwd,
-		modelConfig: run.modelConfig,
-		thinkingLevel: run.thinkingLevel,
-		startedAt: run.startedAt,
-		attempt: run.attempt,
-		attemptStartedAt: run.attemptStartedAt,
-		state: run.state,
-		lastActivityAt: run.lastActivityAt,
-		lastEvent: run.lastEvent,
-		history: run.history,
-		dashboardExpanded: run.dashboardExpanded,
-		stopRequested: run.stopRequested,
-		stopReason: run.stopReason,
-		agentName: run.agentName,
-		debugDir: run.debugDir,
-		lastWorkerSummary: run.lastWorkerSummary,
-		lastFailureReason: run.lastFailureReason,
-		lastVerifierSummary: run.lastVerifierSummary,
-		archivedAt: Date.now(),
-	};
-}
-
-function cloneArchivedRun(snapshot: PersistedRunSnapshot): ActiveRun {
-	return {
-		...snapshot,
-		history: snapshot.history.map((item) => ({ ...item, nextActions: [...item.nextActions] })),
-		currentAbort: undefined,
-		statusTimer: undefined,
-	};
-}
-
-async function persistRunSnapshot(run: ActiveRun): Promise<void> {
-	await ensureDir(runsDirForCwd(run.cwd));
-	await writeFile(latestRunSnapshotPathForCwd(run.cwd), `${JSON.stringify(toPersistedRunSnapshot(run), null, 2)}\n`, "utf8");
-}
-
-async function persistBrainstormDraft(state: BrainstormState): Promise<void> {
-	await ensureDir(path.dirname(state.draftPath));
-	const content = {
-		startedAt: state.startedAt,
-		agentName: state.agentName,
-		phase: state.phase,
-		lastEvent: state.lastEvent,
-		initialRequest: state.initialRequest,
-		latestDraft: state.latestDraft,
-	};
-	await writeFile(state.draftPath, `${JSON.stringify(content, null, 2)}\n`, "utf8");
-}
-
-async function appendAttemptRecord(run: ActiveRun, attempt: AttemptRecord): Promise<void> {
-	await writeFile(historyLogPath(run), `${JSON.stringify(attempt)}\n`, { encoding: "utf8", flag: "a" });
-}
-
-async function restoreLatestArchivedRun(cwd: string): Promise<ActiveRun | null> {
-	const snapshotPath = latestRunSnapshotPathForCwd(cwd);
-	if (!(await pathExists(snapshotPath))) return null;
-	try {
-		const parsed = JSON.parse(await readFile(snapshotPath, "utf8")) as PersistedRunSnapshot;
-		if (parsed.cwd !== cwd) return null;
-		return cloneArchivedRun(parsed);
-	} catch {
-		return null;
-	}
-}
-
-function normalizeConfig(raw: unknown): GoalDrivenConfig {
-	if (!isRecord(raw)) return { ...DEFAULT_CONFIG };
-	const defaultAgent = typeof raw.defaultAgent === "string"
-		? raw.defaultAgent.trim()
-		: typeof raw.agent === "string"
-			? raw.agent.trim()
-			: "";
-	const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
-	const model = typeof raw.model === "string" ? raw.model.trim() : "";
-	return {
-		defaultAgent: defaultAgent || DEFAULT_AGENT_NAME,
-		...(provider ? { provider } : {}),
-		...(model ? { model } : {}),
-	};
-}
-
-async function ensureBundledConfigFile(): Promise<void> {
-	if (await pathExists(BUNDLED_CONFIG_PATH)) return;
-	await writeFile(BUNDLED_CONFIG_PATH, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, "utf8");
-}
-
-async function resolveConfigPath(_cwd: string): Promise<string> {
-	if (await pathExists(GLOBAL_CONFIG_PATH)) return GLOBAL_CONFIG_PATH;
-	return BUNDLED_CONFIG_PATH;
-}
-
-async function copyBundledConfig(destinationPath: string): Promise<void> {
-	await ensureBundledConfigFile();
-	await mkdir(path.dirname(destinationPath), { recursive: true });
-	await copyFile(BUNDLED_CONFIG_PATH, destinationPath);
-}
-
-async function loadGoalDrivenConfig(ctx: ExtensionContext): Promise<{ config: GoalDrivenConfig; path: string }> {
-	await ensureBundledConfigFile();
-	const configPath = await resolveConfigPath(ctx.cwd);
-	try {
-		const parsed = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
-		return { config: parsed, path: configPath };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		ctx.ui.notify(
-			`[${EXTENSION_NAME}] Failed to read config from ${configPath}. Falling back to bundled defaults: ${message}`,
-			"warning",
-		);
-		return { config: { ...DEFAULT_CONFIG }, path: BUNDLED_CONFIG_PATH };
-	}
-}
-
-async function hasGlobalPiSubagentsInstalled(): Promise<boolean> {
-	if (await pathExists(GLOBAL_SUBAGENTS_EXTENSION_PATH)) return true;
-	if (!(await pathExists(GLOBAL_SETTINGS_PATH))) return false;
-
-	try {
-		const settings = JSON.parse(await readFile(GLOBAL_SETTINGS_PATH, "utf8")) as Record<string, unknown>;
-		const packages = Array.isArray(settings.packages) ? settings.packages : [];
-		const extensions = Array.isArray(settings.extensions) ? settings.extensions : [];
-		const allEntries = [...packages, ...extensions].filter((entry): entry is string => typeof entry === "string");
-		return allEntries.some((entry) => {
-			const normalized = entry.toLowerCase();
-			return normalized === "npm:pi-subagents"
-				|| normalized === "pi-subagents"
-				|| normalized.includes("/pi-subagents")
-				|| normalized.includes("pi-subagents@");
-		});
-	} catch {
-		return false;
-	}
-}
-
-function selectConfiguredAgent(
-	agents: AgentConfig[],
-	configuredName: string,
-): { agent: AgentConfig; requestedName: string; fallbackUsed: boolean } {
-	const exact = agents.find((agent) => agent.name === configuredName);
-	if (exact) return { agent: exact, requestedName: configuredName, fallbackUsed: false };
-
-	const fallbackAgent = agents.find((agent) => agent.name === DEFAULT_AGENT_NAME) ?? agents[0]!;
-	return { agent: fallbackAgent, requestedName: configuredName, fallbackUsed: true };
-}
-
-function buildModelRef(provider: string | undefined, modelId: string | undefined): string | undefined {
-	const normalizedProvider = provider?.trim();
-	const normalizedModelId = modelId?.trim();
-	if (!normalizedProvider || !normalizedModelId) return undefined;
-	return `${normalizedProvider}/${normalizedModelId}`;
-}
-
-function buildRunModelConfig(ctx: ExtensionContext, config: GoalDrivenConfig): RunModelConfig {
-	const hasConfiguredModel = Boolean(config.provider && config.model);
-	return {
-		primary: hasConfiguredModel
-			? buildModelRef(config.provider, config.model)
-			: buildModelRef(ctx.model?.provider, ctx.model?.id),
-		exactTarget: hasConfiguredModel,
-	};
-}
-
-function fillPromptTemplate(goal: string, criteria: string): string {
-	return PROMPT_TEMPLATE.replace("[[[[[DEFINE_GOAL_HERE]]]]]", goal).replace(
-		"[[[[[DEFINE_SUCCESS_CRITERIA_HERE]]]]]",
-		criteria,
-	);
-}
-
-function stripFences(text: string): string {
-	const trimmed = text.trim();
-	if (!trimmed.startsWith("```")) return trimmed;
-	return trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-}
-
-function parseVerificationOutput(text: string): VerificationResult {
-	const raw = text.trim();
-	const cleaned = stripFences(raw);
-
-	try {
-		const parsed = JSON.parse(cleaned) as {
-			verdict?: string;
-			summary?: string;
-			nextActions?: unknown;
-		};
-		const verdict = parsed.verdict === "MET" ? "MET" : "NOT_MET";
-		const summary = typeof parsed.summary === "string" && parsed.summary.trim()
-			? parsed.summary.trim()
-			: "Verifier returned no summary.";
-		const nextActions = Array.isArray(parsed.nextActions)
-			? parsed.nextActions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-			: [];
-		return { verdict, summary, nextActions };
-	} catch {
-		const verdictMatch = cleaned.match(/VERDICT\s*:\s*(MET|NOT_MET)/i);
-		const verdict = verdictMatch?.[1]?.toUpperCase() === "MET" ? "MET" : "NOT_MET";
-		const fallback = cleaned || "Verifier returned no output.";
-		return {
-			verdict,
-			summary: truncate(fallback, 400),
-			nextActions: [],
-		};
-	}
-}
-
-function mergeSystemPrompt(base: string | undefined, extra: string): string {
-	const trimmedBase = base?.trim();
-	return trimmedBase ? `${trimmedBase}\n\n${extra}` : extra;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-async function pathExists(targetPath: string): Promise<boolean> {
-	try {
-		await access(targetPath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function buildWorkerAgent(
-	baseAgent: AgentConfig,
-	thinkingLevel: string,
-	_exactTarget: boolean,
-): AgentConfig {
-	return {
-		...baseAgent,
-		name: "goal-driven-worker",
-		description: `Goal-Driven worker based on ${baseAgent.name}`,
-		tools: baseAgent.tools,
-		fallbackModels: undefined,
-		systemPrompt: mergeSystemPrompt(baseAgent.systemPrompt, WORKER_SYSTEM_PROMPT),
-		thinking: thinkingLevel === "off" ? undefined : thinkingLevel,
-	};
-}
-
-function buildVerifierAgent(
-	baseAgent: AgentConfig,
-	thinkingLevel: string,
-	_exactTarget: boolean,
-): AgentConfig {
-	return {
-		name: "goal-driven-verifier",
-		description: "Read-only Goal-Driven verifier",
-		tools: [...VERIFIER_TOOLS],
-		mcpDirectTools: [],
-		model: baseAgent.model,
-		fallbackModels: undefined,
-		thinking: thinkingLevel === "off" ? undefined : thinkingLevel,
-		systemPrompt: VERIFIER_SYSTEM_PROMPT,
-		source: baseAgent.source,
-		filePath: baseAgent.filePath,
-		skills: undefined,
-		extensions: undefined,
-		output: undefined,
-		defaultReads: undefined,
-		defaultProgress: false,
-		interactive: false,
-		maxSubagentDepth: baseAgent.maxSubagentDepth,
-		extraFields: undefined,
-		override: undefined,
-	};
-}
-
-async function readLatestAssistantTextFromSessionDir(sessionDir: string): Promise<string | undefined> {
-	let files: string[];
-	try {
-		files = (await readdir(sessionDir)).filter((file) => file.endsWith(".jsonl")).sort();
-	} catch {
-		return undefined;
-	}
-	if (files.length === 0) return undefined;
-	const sessionPath = path.join(sessionDir, files[files.length - 1]!);
-	let content: string;
-	try {
-		content = await readFile(sessionPath, "utf8");
-	} catch {
-		return undefined;
-	}
-	const lines = content.split("\n").filter(Boolean);
-	for (let i = lines.length - 1; i >= 0; i--) {
-		try {
-			const entry = JSON.parse(lines[i]!) as {
-				type?: string;
-				message?: { role?: string; content?: Array<{ type?: string; text?: string }> };
-			};
-			if (entry.type !== "message") continue;
-			if (entry.message?.role !== "assistant") continue;
-			const text = entry.message.content
-				?.filter((part) => part.type === "text" && typeof part.text === "string")
-				.map((part) => part.text ?? "")
-				.join("")
-				.trim();
-			if (text) return text;
-		} catch {
-			continue;
-		}
-	}
-	return undefined;
-}
-
-async function summarizeSingleResult(result: SingleResult, sessionDir?: string): Promise<string> {
-	const output = getSingleResultOutput(result).trim();
-	if (output) return truncate(output);
-	if (sessionDir) {
-		const sessionOutput = await readLatestAssistantTextFromSessionDir(sessionDir);
-		if (sessionOutput) return truncate(sessionOutput);
-	}
-	if (result.error?.trim()) return truncate(result.error);
-	return "No assistant output.";
-}
-
-function summarizeProgressUpdate(update: ProgressUpdate, fallbackAgent: string): string {
-	const progress = update.details?.progress?.[0] ?? update.details?.results?.[0]?.progress;
-	if (progress) {
-		if (progress.currentTool) {
-			const args = progress.currentToolArgs ? ` ${singleLine(progress.currentToolArgs, 60)}` : "";
-			return `${progress.agent}: ${progress.currentTool}${args}`;
-		}
-		const recentOutput = progress.recentOutput.find((line) => line.trim().length > 0);
-		if (recentOutput) return `${progress.agent}: ${singleLine(recentOutput, 120)}`;
-		if (progress.status) return `${progress.agent}: ${progress.status}`;
-	}
-
-	const text = update.content?.find((part) => part.type === "text" && typeof part.text === "string")?.text;
-	return `${fallbackAgent}: ${singleLine(text ?? "Working...", 120)}`;
-}
-
-function buildHistoryBlock(history: AttemptRecord[]): string {
-	if (history.length === 0) return "No previous attempts.";
-
-	return history
-		.slice(-HISTORY_LIMIT)
-		.map((item) => {
-			const duration = Math.max(0, item.finishedAt - item.startedAt);
-			const nextActions = item.verdict === "MET" ? "Goal met." : item.verifierSummary;
-			return [
-				`Attempt ${item.attempt} (${Math.round(duration / 1_000)}s)`,
-				`Why it ended: ${item.reason}`,
-				`Worker summary: ${item.workerSummary}`,
-				`Verifier: ${nextActions}`,
-			].join("\n");
-		})
-		.join("\n\n");
-}
-
-function buildWorkerTask(run: ActiveRun): string {
-	return [
-		`Goal:\n${run.goal}`,
-		run.brainstormSummary ? `Brainstorm handoff:\n${run.brainstormSummary}` : "",
-		`Criteria for success:\n${run.criteria}`,
-		`Current attempt: #${run.attempt}`,
-		`Previous attempt notes:\n${buildHistoryBlock(run.history)}`,
-		`Reference Goal-Driven prompt:\n${run.filledPrompt}`,
-		"Continue from the current workspace state and make concrete progress now.",
-	].filter(Boolean).join("\n\n");
-}
-
-function buildVerifierTask(run: ActiveRun, workerSummary: string, reason: string): string {
-	return [
-		`Goal:\n${run.goal}`,
-		`Criteria for success:\n${run.criteria}`,
-		`The latest subagent attempt ended because: ${reason}`,
-		`Subagent final output:\n${workerSummary || "(no assistant output)"}`,
-		"Inspect the current workspace and decide whether the criteria are already met.",
-	].join("\n\n");
-}
-
-function attemptStatusLabel(status: AttemptStatus): string {
-	switch (status) {
-		case "success":
-			return "met";
-		case "inactive":
-			return "inactive";
-		case "worker_failed":
-			return "failed";
-		default:
-			return "retry";
-	}
-}
-
-function attemptStatusColor(theme: Theme, status: AttemptStatus): string {
-	if (status === "success") return theme.fg("success", attemptStatusLabel(status));
-	if (status === "inactive") return theme.fg("warning", attemptStatusLabel(status));
-	if (status === "worker_failed") return theme.fg("error", attemptStatusLabel(status));
-	return theme.fg("warning", attemptStatusLabel(status));
-}
-
-function currentPhaseLabel(run: ActiveRun): string {
-	if (run.state === "running") return "running";
-	if (run.state === "verifying") return "verifying";
-	return "stopping";
-}
-
-function hasInFlightAttempt(run: ActiveRun): boolean {
-	return run.attempt > run.history.length && !run.stopRequested;
-}
-
-function getAttemptCounts(run: ActiveRun): {
-	started: number;
-	met: number;
-	retry: number;
-	failed: number;
-	inactive: number;
-} {
-	const met = run.history.filter((item) => item.status === "success").length;
-	const retry = run.history.filter((item) => item.status === "not_met").length;
-	const failed = run.history.filter((item) => item.status === "worker_failed").length;
-	const inactive = run.history.filter((item) => item.status === "inactive").length;
-	return {
-		started: run.attempt,
-		met,
-		retry,
-		failed,
-		inactive,
-	};
-}
-
-function extractSectionBullets(text: string, section: "SUMMARY" | "OPEN_ISSUES"): string[] {
-	const match = text.match(new RegExp(`${section}:([\\s\\S]*?)(?:\\n[A-Z_]+:|$)`));
-	if (!match) return [];
-	return match[1]
-		.split("\n")
-		.map((line) => line.trim())
-		.filter((line) => line.startsWith("- "))
-		.map((line) => line.slice(2).trim())
-		.filter((line) => line.length > 0 && line !== "none");
-}
-
-function firstMeaningfulLine(text: string): string | undefined {
-	for (const rawLine of text.split("\n")) {
-		const line = rawLine.trim();
-		if (!line) continue;
-		if (line === "GOAL_DRIVEN_STATUS: READY_FOR_VERIFICATION") continue;
-		if (line === "SUMMARY:" || line === "OPEN_ISSUES:") continue;
-		if (line.startsWith("```")) continue;
-		if (line.startsWith("- ")) return line.slice(2).trim();
-		return line;
-	}
-	return undefined;
-}
-
-function summarizeAttempt(status: AttemptStatus, verification: VerificationResult, reason: string, workerSummary: string): string {
-	const summaryBullets = extractSectionBullets(workerSummary, "SUMMARY");
-	const issueBullets = extractSectionBullets(workerSummary, "OPEN_ISSUES");
-	const workerDescription = summaryBullets[0] ?? issueBullets[0] ?? firstMeaningfulLine(workerSummary);
-	if (status === "success") return singleLine(workerDescription ?? verification.summary, 220);
-	if (status === "worker_failed") return singleLine(workerDescription ?? reason, 220);
-	if (status === "inactive") return singleLine(workerDescription ?? verification.summary ?? reason, 220);
-	const nextAction = verification.nextActions[0];
-	if (workerDescription && nextAction) return singleLine(`${workerDescription} → ${nextAction}`, 220);
-	return singleLine(workerDescription ?? nextAction ?? verification.summary ?? reason, 220);
-}
-
-function padCell(text: string, width: number): string {
-	const truncated = truncateToWidth(text, width, "…", true);
-	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
-}
-
-function appendRightAlignedAdaptiveHint(left: string, width: number, theme: Theme, hints: string[]): string {
-	for (const candidate of hints) {
-		const hint = theme.fg("dim", candidate);
-		const leftWidth = visibleWidth(left);
-		const hintWidth = visibleWidth(hint);
-		if (leftWidth + hintWidth <= width) {
-			return left + " ".repeat(Math.max(0, width - leftWidth - hintWidth)) + hint;
-		}
-		const availableLeftWidth = Math.max(0, width - hintWidth);
-		const truncatedLeft = truncateToWidth(left, availableLeftWidth, "…", true);
-		const truncatedLeftWidth = visibleWidth(truncatedLeft);
-		if (truncatedLeftWidth + hintWidth <= width) {
-			return truncatedLeft + " ".repeat(Math.max(0, width - truncatedLeftWidth - hintWidth)) + hint;
-		}
-	}
-	return truncateToWidth(left, width, "…", true);
-}
-
-function runTitle(run: ActiveRun): string {
-	return `🔬 goal-driven: ${run.goal}`;
-}
-
-function liveSummary(run: ActiveRun): string {
-	if (run.state === "verifying") return run.lastVerifierSummary ?? run.lastEvent;
-	return run.lastEvent;
-}
-
-function currentAttemptElapsedMs(run: ActiveRun): number {
-	if (activeRun === run && hasInFlightAttempt(run) && !run.stopRequested) {
-		return Math.max(0, Date.now() - run.attemptStartedAt);
-	}
-	const completedAttempt = [...run.history].reverse().find((item) => item.attempt === run.attempt);
-	if (completedAttempt) return Math.max(0, completedAttempt.finishedAt - completedAttempt.startedAt);
-	return Math.max(0, run.lastActivityAt - run.attemptStartedAt);
-}
-
-function renderCompactWidgetLines(run: ActiveRun, theme: Theme, width: number): string[] {
-	const counts = getAttemptCounts(run);
-	const left = [
-		theme.fg("accent", "🔬 goal-driven"),
-		theme.fg("muted", ` ${counts.started} runs`),
-		theme.fg("success", ` ${counts.met} met`),
-		counts.retry > 0 ? theme.fg("warning", ` ${counts.retry} retry`) : "",
-		counts.failed > 0 ? theme.fg("error", ` ${counts.failed} failed`) : "",
-		counts.inactive > 0 ? theme.fg("warning", ` ${counts.inactive} inactive`) : "",
-		theme.fg("dim", " │ "),
-		theme.fg("warning", theme.bold(`★ active: #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(currentAttemptElapsedMs(run))}`)),
-		theme.fg("dim", " │ "),
-		theme.fg("muted", singleLine(liveSummary(run), 120)),
-	].join("");
-	return [
-		appendRightAlignedAdaptiveHint(left, width, theme, [
-			"ctrl+x expand • ctrl+shift+x fullscreen",
-			"ctrl+x expand • full: c-s-x",
-			"ctrl+x • c-s-x",
-		]),
-	];
-}
-
-function getDashboardTableLayout(width: number): {
-	idxWidth: number;
-	durWidth: number;
-	resultWidth: number;
-	summaryWidth: number;
-} {
-	const idxWidth = 4;
-	const durWidth = 9;
-	const resultWidth = 12;
-	const summaryWidth = Math.max(20, width - 2 - idxWidth - durWidth - resultWidth);
-	return { idxWidth, durWidth, resultWidth, summaryWidth };
-}
-
-function renderDashboardSummaryLines(run: ActiveRun, theme: Theme, width: number): string[] {
-	const counts = getAttemptCounts(run);
-	return [
-		truncateToWidth(
-			`  ${theme.fg("muted", "Runs:")} ${theme.fg("text", String(counts.started))}` +
-				`  ${theme.fg("success", `${counts.met} met`)}` +
-				(counts.retry > 0 ? `  ${theme.fg("warning", `${counts.retry} retry`)}` : "") +
-				(counts.failed > 0 ? `  ${theme.fg("error", `${counts.failed} failed`)}` : "") +
-				(counts.inactive > 0 ? `  ${theme.fg("warning", `${counts.inactive} inactive`)}` : ""),
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Active:")} ${theme.fg("warning", `★ #${run.attempt} ${currentPhaseLabel(run)} ${formatElapsed(currentAttemptElapsedMs(run))}`)}`,
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Live:")} ${theme.fg("text", singleLine(liveSummary(run), 220))}`,
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Criteria:")} ${theme.fg("muted", singleLine(run.criteria, 220))}`,
-			width,
-			"…",
-			true,
-		),
-	];
-}
-
-function attemptSummaryPrefix(status: AttemptStatus): string {
-	switch (status) {
-		case "success":
-			return "✓";
-		case "worker_failed":
-			return "✕";
-		case "inactive":
-			return "⏸";
-		default:
-			return "↺";
-	}
-}
-
-function attemptRowColor(theme: Theme, status: AttemptStatus): "text" | "success" | "warning" | "error" {
-	if (status === "success") return "success";
-	if (status === "worker_failed") return "error";
-	if (status === "inactive") return "warning";
-	return "warning";
-}
-
-function renderDashboardTableHeaderLines(theme: Theme, width: number, headerHint?: string): string[] {
-	const layout = getDashboardTableLayout(width);
-	const headerLine =
-		`  ${theme.fg("muted", padCell("#", layout.idxWidth))}` +
-		`${theme.fg("muted", padCell("duration", layout.durWidth))}` +
-		`${theme.fg("muted", padCell("result", layout.resultWidth))}` +
-		`${theme.fg("muted", "description")}`;
-	return [
-		headerHint
-			? appendRightAlignedAdaptiveHint(headerLine, width, theme, [headerHint, "ctrl+x • c-s-x"])
-			: truncateToWidth(headerLine, width, "…", true),
-		truncateToWidth(`  ${theme.fg("borderAccent", "─".repeat(Math.max(0, width - 2)))}`, width, "…", true),
-	];
-}
-
-function renderDashboardAttemptLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS): string[] {
-	const layout = getDashboardTableLayout(width);
-	const lines: string[] = [];
-	const effectiveMax = maxRows <= 0 ? run.history.length : maxRows;
-	const start = Math.max(0, run.history.length - effectiveMax);
-	if (start > 0) {
-		lines.push(truncateToWidth(`  ${theme.fg("dim", `… ${start} earlier experiment${start === 1 ? "" : "s"}`)}`, width, "…", true));
-	}
-
-	for (const item of run.history.slice(start)) {
-		const tone = attemptRowColor(theme, item.status);
-		const duration = formatElapsed(item.finishedAt - item.startedAt);
-		const summary = `${attemptSummaryPrefix(item.status)} ${item.summary}`;
-		const row =
-			`  ${theme.fg(tone, padCell(String(item.attempt), layout.idxWidth))}` +
-			`${theme.fg(tone, padCell(duration, layout.durWidth))}` +
-			`${padCell(attemptStatusColor(theme, item.status), layout.resultWidth)}` +
-			`${theme.fg(tone, truncateToWidth(summary, layout.summaryWidth, "…", true))}`;
-		lines.push(truncateToWidth(row, width, "…", true));
-	}
-
-	if (hasInFlightAttempt(run)) {
-		const spinner = OVERLAY_SPINNER[Math.floor(Date.now() / 120) % OVERLAY_SPINNER.length] ?? "•";
-		const row =
-			`  ${theme.fg("accent", padCell(String(run.attempt), layout.idxWidth))}` +
-			`${theme.fg("warning", theme.bold(padCell(formatElapsed(currentAttemptElapsedMs(run)), layout.durWidth)))}` +
-			`${padCell(theme.fg("accent", theme.bold(`${spinner} ${currentPhaseLabel(run)}`)), layout.resultWidth)}` +
-			`${theme.fg("text", truncateToWidth(`★ ${singleLine(liveSummary(run), 220)}`, layout.summaryWidth, "…", true))}`;
-		lines.push(theme.bg("selectedBg", truncateToWidth(row, width, "…", true).padEnd(width, " ")));
-	}
-
-	return lines;
-}
-
-function renderDashboardBodyLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
-	return [
-		...renderDashboardSummaryLines(run, theme, width),
-		"",
-		...renderDashboardTableHeaderLines(theme, width, headerHint),
-		...renderDashboardAttemptLines(run, theme, width, maxRows),
-	];
-}
-
-function renderExpandedWidgetLines(run: ActiveRun, theme: Theme, width: number, maxRows = DASHBOARD_MAX_ROWS, headerHint?: string): string[] {
-	const title = truncateToWidth(runTitle(run), Math.max(0, width - 8), "…", true);
-	const fillLen = Math.max(0, width - 3 - 1 - visibleWidth(title) - 1);
-	return [
-		truncateToWidth(
-			theme.fg("borderMuted", "───") +
-				theme.fg("accent", ` ${title} `) +
-				theme.fg("borderMuted", "─".repeat(fillLen)),
-			width,
-			"…",
-			true,
-		),
-		...renderDashboardBodyLines(run, theme, width, maxRows, headerHint),
-	];
-}
-
-function renderBorderBox(theme: Theme, width: number, title: string, bodyLines: string[]): string[] {
-	const innerWidth = Math.max(1, width - 2);
-	const safeTitle = truncateToWidth(` ${title} `, innerWidth, "…", true);
-	const safeTitleWidth = visibleWidth(safeTitle);
-	const leftBorderWidth = Math.max(0, Math.floor((innerWidth - safeTitleWidth) / 2));
-	const rightBorderWidth = Math.max(0, innerWidth - safeTitleWidth - leftBorderWidth);
-	const padLine = (line: string) => truncateToWidth(line, innerWidth, "…", true).padEnd(innerWidth, " ");
-	return [
-		theme.fg("border", `╭${"─".repeat(leftBorderWidth)}`) +
-			theme.fg("accent", safeTitle) +
-			theme.fg("border", `${"─".repeat(rightBorderWidth)}╮`),
-		...bodyLines.map((line) => theme.fg("border", "│") + padLine(line) + theme.fg("border", "│")),
-		theme.fg("border", `╰${"─".repeat(innerWidth)}╯`),
-	];
-}
-
-function renderFullscreenOverlayLines(run: ActiveRun, theme: Theme, width: number, viewportRows: number, scrollOffset: number): {
-	lines: string[];
-	totalRows: number;
-} {
-	const innerWidth = Math.max(1, width - 2);
-	const summaryLines = renderDashboardSummaryLines(run, theme, innerWidth);
-	const fixedTableHeaderLines = renderDashboardTableHeaderLines(theme, innerWidth, "esc close • ↑↓ scroll");
-	const attemptLines = renderDashboardAttemptLines(run, theme, innerWidth, 0);
-	const fixedLines = [...summaryLines, "", ...fixedTableHeaderLines];
-	const visibleBodyRows = Math.max(1, viewportRows - fixedLines.length - 1);
-	const maxScroll = Math.max(0, attemptLines.length - visibleBodyRows);
-	const clampedOffset = clamp(scrollOffset, 0, maxScroll);
-	const visibleBody = attemptLines.slice(clampedOffset, clampedOffset + visibleBodyRows);
-	while (visibleBody.length < visibleBodyRows) visibleBody.push("");
-	const scrollInfo = attemptLines.length > visibleBodyRows
-		? ` ${clampedOffset + 1}-${Math.min(clampedOffset + visibleBodyRows, attemptLines.length)}/${attemptLines.length}`
-		: "";
-	const helpText = width >= 85
-		? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
-		: ` j/k scroll • esc close${scrollInfo} `;
-	const footer = appendRightAlignedAdaptiveHint("", innerWidth, theme, [helpText.trim(), `esc${scrollInfo}`]);
-	return {
-		lines: renderBorderBox(theme, width, runTitle(run), [...fixedLines, ...visibleBody, footer]),
-		totalRows: attemptLines.length,
-	};
-}
-
-function buildStatusLines(run: ActiveRun): string[] {
-	const counts = getAttemptCounts(run);
-	const lines = [
-		`🎯 Goal-Driven (${run.state})`,
-		`Subagent profile: ${run.agentName}`,
-		`Model: ${run.modelConfig.primary ?? "inherit current Pi model"}${run.modelConfig.exactTarget ? " (configured)" : ""}`,
-		`Goal: ${singleLine(run.goal, 120)}`,
-		`Criteria: ${singleLine(run.criteria, 120)}`,
-		`Experiments: ${counts.started} started, ${counts.met} met, ${counts.retry} retry, ${counts.failed} failed, ${counts.inactive} inactive`,
-		`Current attempt: #${run.attempt} ${currentPhaseLabel(run)} (${formatElapsed(currentAttemptElapsedMs(run))})`,
-		`Last activity: ${formatDuration(Date.now() - run.lastActivityAt)}`,
-		`Last event: ${singleLine(run.lastEvent, 120)}`,
-		`Logs: ${run.debugDir}`,
-	];
-
-	for (const item of run.history.slice(-5).reverse()) {
-		lines.push(
-			`Experiment #${item.attempt} ${attemptStatusLabel(item.status)} (${formatElapsed(item.finishedAt - item.startedAt)}): ${singleLine(item.summary, 120)}`,
-		);
-	}
-
-	return lines;
-}
-
-function getDisplayRun(): ActiveRun | null {
-	return activeRun ?? latestArchivedRun;
-}
-
-function clearUiStatus(): void {
-	if (!latestCtx?.hasUI || !latestCtx.ui) return;
-	latestCtx.ui.setStatus(COMMAND_NAME, undefined);
-	latestCtx.ui.setWidget(COMMAND_NAME, undefined);
-}
-
-function refreshUiStatus(): void {
-	if (!latestCtx?.hasUI || !latestCtx.ui) return;
-	if (activeBrainstorm && !activeRun) {
-		const brainstorm = activeBrainstorm;
-		latestCtx.ui.setStatus(COMMAND_NAME, `💭 ${brainstormPhaseLabel(brainstorm.phase)}`);
-		latestCtx.ui.setWidget(COMMAND_NAME, (tui, theme) => ({
-			render(width: number): string[] {
-				const safeWidth = Math.max(1, width || getTuiSize(tui).width);
-				return safeWidth < 95
-					? renderBrainstormCompactWidgetLines(brainstorm, theme, safeWidth)
-					: renderBrainstormExpandedWidgetLines(brainstorm, theme, safeWidth);
-			},
-			invalidate(): void {},
-		}));
-		return;
-	}
-	if (!activeRun) {
-		clearUiStatus();
-		return;
-	}
-
-	const run = activeRun;
-	const counts = getAttemptCounts(run);
-	const label = run.state === "running"
-		? `🔬 ${counts.started} runs`
-		: run.state === "verifying"
-			? `🔎 #${run.attempt} verifying`
-			: "⏹ stopping";
-	latestCtx.ui.setStatus(COMMAND_NAME, label);
-	latestCtx.ui.setWidget(COMMAND_NAME, (tui, theme) => ({
-		render(width: number): string[] {
-			const safeWidth = Math.max(1, width || getTuiSize(tui).width);
-			return run.dashboardExpanded
-				? renderExpandedWidgetLines(run, theme, safeWidth, safeWidth < 95 ? 4 : DASHBOARD_MAX_ROWS, "ctrl+x collapse • ctrl+shift+x fullscreen")
-				: renderCompactWidgetLines(run, theme, safeWidth);
-		},
-		invalidate(): void {},
-	}));
-}
-
-function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
-	latestCtx?.ui?.notify(message, level);
-}
+let activeBrainstorm: ActiveBrainstorm | null = null;
+let activeRun: ActiveRun | null = null;
+let watchdogTimer: NodeJS.Timeout | null = null;
 
 function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
 	return message.role === "assistant";
@@ -1154,766 +93,1120 @@ function getAssistantText(message: AssistantMessage): string {
 		.join("");
 }
 
-function normalizeCriteriaText(criteria: string): string {
-	return criteria
-		.split("\n")
-		.map((line) => line.trimEnd())
-		.join("\n")
-		.trim();
+function assistantMessageHasSubagentExecutionCall(message: AssistantMessage): boolean {
+	return message.content.some((part) => {
+		const candidate = part as { type?: string; name?: string; arguments?: Record<string, unknown> };
+		return candidate.type === "toolCall" && candidate.name === "subagent" && isSubagentExecutionInput(candidate.arguments);
+	});
 }
 
-function normalizeGoalText(goal: string): string {
-	return goal
-		.replace(/^[-*]\s+/gm, "")
-		.trim();
+function singleLine(text: string, max = 140): string {
+	const normalized = text.replace(/\s+/g, " ").trim();
+	if (normalized.length <= max) return normalized;
+	return `${normalized.slice(0, max - 1)}…`;
 }
 
-function normalizeCriteriaBlock(criteria: string): string {
-	const cleaned = criteria
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(Boolean)
-		.filter((line) => !/^If this looks right/i.test(line))
-		.filter((line) => !/^Reply\s*`?\**ok\**`?/i.test(line))
-		.filter((line) => !(/\bok\b/i.test(line) && /(Goal-Driven|Goal|Criteria)/i.test(line)));
-	return normalizeCriteriaText(cleaned.join("\n"));
+function normalizeGoal(text: string): string {
+	return text.trim();
 }
 
-function normalizeBrainstormHeadings(text: string): string {
-	return text
-		.replace(/\*\*\s*(Goal|Criteria for success|Criteria)\s*\*\*/gi, "$1")
-		.replace(/\r/g, "")
-		.trim();
+function normalizeCriteria(text: string): string {
+	return text.trim();
 }
 
-function parseBrainstormResult(text: string): BrainstormResult | null {
-	const normalized = normalizeBrainstormHeadings(text);
-	if (!normalized) return null;
-
-	const goalMatch = normalized.match(/(?:^|\n)(?:Goal)\s*[:：]?\s*\n+([\s\S]*?)(?=\n{1,3}(?:Criteria for success|Criteria)\s*[:：]?\s*\n)/i);
-	const criteriaMatch = normalized.match(/(?:^|\n)(?:Criteria for success|Criteria)\s*[:：]?\s*\n+([\s\S]*?)(?=\n{1,3}(?:If this looks right|Reply\s*`?\**ok\**`?|.*\bok\b.*Goal-Driven)|$)/i);
-
-	if (!goalMatch || !criteriaMatch) return null;
-
-	const goal = normalizeGoalText(goalMatch[1] ?? "");
-	const criteria = normalizeCriteriaBlock(criteriaMatch[1] ?? "");
-	if (!goal || !criteria) return null;
-
-	return {
-		goal,
-		criteria,
-		summary: singleLine(goal, 120),
-	};
+function hasUnfilledPlaceholders(text: string): boolean {
+	return text.includes(PLACEHOLDER_TOKEN);
 }
 
-function brainstormPhaseLabel(phase: BrainstormPhase): string {
-	switch (phase) {
-		case "starting":
-			return "starting";
-		case "researching":
-			return "researching";
-		case "drafting":
-			return "drafting";
-		case "awaiting-confirmation":
-			return "awaiting confirmation";
+function hasMetVerdict(text: string): boolean {
+	return text.includes(MASTER_MET_VERDICT);
+}
+
+function hasTool(pi: ExtensionAPI, toolName: string): boolean {
+	return pi.getAllTools().some((tool) => tool.name === toolName);
+}
+
+function ensureToolActive(pi: ExtensionAPI, toolName: string): boolean {
+	if (!hasTool(pi, toolName)) return false;
+	const activeTools = new Set(pi.getActiveTools());
+	if (!activeTools.has(toolName)) {
+		activeTools.add(toolName);
+		pi.setActiveTools([...activeTools]);
 	}
-}
-
-function renderBrainstormCompactWidgetLines(state: BrainstormState, theme: Theme, width: number): string[] {
-	const elapsed = formatElapsed(Date.now() - state.startedAt);
-	const left = [
-		theme.fg("accent", "💭 goal-driven brainstorm"),
-		theme.fg("dim", " │ "),
-		theme.fg("warning", theme.bold(`${brainstormPhaseLabel(state.phase)} ${elapsed}`)),
-		theme.fg("dim", " │ "),
-		theme.fg("muted", singleLine(state.lastEvent || state.initialRequest, 120)),
-	].join("");
-	return [
-		appendRightAlignedAdaptiveHint(left, width, theme, [
-			"waiting in chat • stop: /goal-driven stop",
-			"chat • stop: /goal-driven stop",
-			"/goal-driven stop",
-		]),
-	];
-}
-
-function renderBrainstormExpandedWidgetLines(state: BrainstormState, theme: Theme, width: number): string[] {
-	const title = truncateToWidth("💭 goal-driven brainstorm", Math.max(0, width - 8), "…", true);
-	const fillLen = Math.max(0, width - 3 - 1 - visibleWidth(title) - 1);
-	return [
-		truncateToWidth(
-			theme.fg("borderMuted", "───") +
-				theme.fg("accent", ` ${title} `) +
-				theme.fg("borderMuted", "─".repeat(fillLen)),
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Agent:")} ${theme.fg("text", state.agentName)}  ${theme.fg("muted", "Phase:")} ${theme.fg("warning", brainstormPhaseLabel(state.phase))}  ${theme.fg("muted", "Elapsed:")} ${theme.fg("text", formatElapsed(Date.now() - state.startedAt))}`,
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Request:")} ${theme.fg("text", singleLine(state.initialRequest, 220))}`,
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("muted", "Live:")} ${theme.fg("text", singleLine(state.lastEvent || "Waiting for assistant response...", 220))}`,
-			width,
-			"…",
-			true,
-		),
-		truncateToWidth(
-			`  ${theme.fg("dim", "Reply in chat when prompted. Use /goal-driven stop to cancel.")}`,
-			width,
-			"…",
-			true,
-		),
-	];
-}
-
-function buildBrainstormStatusSummary(state: BrainstormState): string {
-	return [
-		`Brainstorm active with '${state.agentName}'`,
-		`Phase: ${brainstormPhaseLabel(state.phase)}`,
-		`Elapsed: ${formatElapsed(Date.now() - state.startedAt)}`,
-		`Request: ${singleLine(state.initialRequest, 160)}`,
-		`Live: ${singleLine(state.lastEvent || "Waiting for assistant response...", 160)}`,
-		"Reply in chat when prompted. Use /goal-driven stop to cancel.",
-	].join("\n");
-}
-
-function finalizeRun(run: ActiveRun | null, message?: string, level: "info" | "warning" | "error" = "info"): void {
-	if (!run) return;
-	if (run.statusTimer) clearInterval(run.statusTimer);
-	if (run.currentAbort) run.currentAbort.abort();
-	latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
-	void persistRunSnapshot(run);
-	if (activeRun === run) activeRun = null;
-	clearUiStatus();
-	if (message) notify(message, level);
-}
-
-function requestStop(reason: string): boolean {
-	if (!activeRun) return false;
-	activeRun.stopRequested = true;
-	activeRun.stopReason = reason;
-	activeRun.state = "stopping";
-	activeRun.lastEvent = reason;
-	activeRun.currentAbort?.abort();
-	refreshUiStatus();
 	return true;
 }
 
-async function runManagedSubagent(
-	run: ActiveRun,
-	agent: AgentConfig,
-	task: string,
-	phase: "worker" | "verifier",
-): Promise<ManagedSingleRun> {
-	const controller = new AbortController();
-	run.currentAbort = controller;
-	let lastActivityAt = Date.now();
-	let killedForInactivity = false;
-	const shouldWatchInactivity = phase === "worker";
-	const attemptDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-${phase}-${sanitizePathSegment(agent.name)}`);
-	const sessionDir = path.join(attemptDir, "session");
-	const artifactsDir = path.join(attemptDir, "artifacts");
-	await mkdir(sessionDir, { recursive: true });
-	await mkdir(artifactsDir, { recursive: true });
+function isSubagentExecutionInput(input: unknown): boolean {
+	if (!input || typeof input !== "object") return false;
+	const candidate = input as Record<string, unknown>;
+	return typeof candidate.agent === "string" || Array.isArray(candidate.tasks) || Array.isArray(candidate.chain);
+}
 
-	const interval = shouldWatchInactivity
-		? setInterval(() => {
-			if (run.stopRequested || controller.signal.aborted) return;
-			if (Date.now() - lastActivityAt < INACTIVITY_WINDOW_MS) return;
-			killedForInactivity = true;
-			run.lastActivityAt = Date.now();
-			run.lastEvent = "Subagent inactive for 5 minutes; restarting.";
-			refreshUiStatus();
-			controller.abort();
-		}, INACTIVITY_CHECK_MS)
-		: undefined;
+function forceGoalDrivenSubagentExecution(input: unknown): void {
+	if (!input || typeof input !== "object") return;
+	const candidate = input as Record<string, unknown>;
+	candidate.async = true;
+	candidate.clarify = false;
 
-	try {
-		const runOptions = {
-			cwd: run.cwd,
-			signal: controller.signal,
-			runId: `goal-driven-${phase}-${run.attempt}-${randomUUID().slice(0, 8)}`,
-			modelOverride: run.modelConfig.primary,
-			sessionDir,
-			artifactsDir,
-			artifactConfig: {
-				enabled: true,
-				includeInput: true,
-				includeOutput: true,
-				includeJsonl: true,
-				includeMetadata: true,
-			},
-			onUpdate: (update: unknown) => {
-				lastActivityAt = Date.now();
-				run.lastActivityAt = lastActivityAt;
-				run.lastEvent = summarizeProgressUpdate(update as ProgressUpdate, agent.name);
-				refreshUiStatus();
-			},
-		} as any;
-		const result = await runSync(run.cwd, [agent], agent.name, task, runOptions);
-
-		return { result, killedForInactivity };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			result: {
-				agent: agent.name,
-				task,
-				exitCode: 1,
-				messages: [],
-				usage: emptyUsage(),
-				error: message,
-				finalOutput: "",
-			},
-			killedForInactivity,
-		};
-	} finally {
-		if (interval) clearInterval(interval);
-		if (run.currentAbort === controller) run.currentAbort = undefined;
+	if (typeof candidate.agent === "string") {
+		candidate.agent = GOAL_DRIVEN_WORKER_AGENT;
 	}
-}
 
-async function runVerification(run: ActiveRun, verifierAgent: AgentConfig, workerSummary: string, reason: string): Promise<VerificationResult> {
-	const verificationRun = await runManagedSubagent(run, verifierAgent, buildVerifierTask(run, workerSummary, reason), "verifier");
-	const verifierSessionDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-verifier-${sanitizePathSegment(verifierAgent.name)}`, "session");
-	const text = await summarizeSingleResult(verificationRun.result, verifierSessionDir);
-	return parseVerificationOutput(text);
-}
-
-async function supervise(run: ActiveRun, baseAgent: AgentConfig): Promise<void> {
-	const workerAgent = buildWorkerAgent(
-		baseAgent,
-		run.thinkingLevel,
-		run.modelConfig.exactTarget,
-	);
-	const verifierAgent = buildVerifierAgent(
-		baseAgent,
-		run.thinkingLevel,
-		run.modelConfig.exactTarget,
-	);
-
-	run.statusTimer = setInterval(() => {
-		if (activeRun === run) refreshUiStatus();
-	}, STATUS_REFRESH_MS);
-
-	refreshUiStatus();
-	notify(`Goal-Driven started with '${run.agentName}'. Use Ctrl+X for the experiment list and Ctrl+Shift+X for fullscreen.`, "info");
-
-	while (!run.stopRequested) {
-		run.attempt += 1;
-		run.state = "running";
-		run.lastActivityAt = Date.now();
-		run.lastEvent = `Starting ${run.agentName} attempt #${run.attempt}`;
-		refreshUiStatus();
-
-		run.attemptStartedAt = Date.now();
-		const attemptStartedAt = run.attemptStartedAt;
-		const workerRun = await runManagedSubagent(run, workerAgent, buildWorkerTask(run), "worker");
-		if (run.stopRequested) break;
-
-		const workerSessionDir = path.join(run.debugDir, `${String(run.attempt).padStart(3, "0")}-worker-${sanitizePathSegment(workerAgent.name)}`, "session");
-		const workerSummary = await summarizeSingleResult(workerRun.result, workerSessionDir);
-		const reason = workerRun.killedForInactivity
-			? "the subagent was inactive for 5 minutes"
-			: workerRun.result.exitCode === 0
-				? "the subagent stopped and requested verification"
-				: workerRun.result.error
-					? `the subagent failed: ${singleLine(workerRun.result.error, 120)}`
-					: `the subagent exited with code ${workerRun.result.exitCode}`;
-		run.lastWorkerSummary = workerSummary;
-		run.lastFailureReason = reason;
-
-		run.state = "verifying";
-		run.lastActivityAt = Date.now();
-		run.lastEvent = `Verifying after attempt #${run.attempt}`;
-		refreshUiStatus();
-
-		const verification = await runVerification(run, verifierAgent, workerSummary, reason);
-		if (run.stopRequested) break;
-
-		run.lastVerifierSummary = verification.summary;
-		const attemptStatus: AttemptStatus = verification.verdict === "MET"
-			? "success"
-			: workerRun.killedForInactivity
-				? "inactive"
-				: workerRun.result.exitCode === 0
-					? "not_met"
-					: "worker_failed";
-		const attemptSummary = summarizeAttempt(attemptStatus, verification, reason, workerSummary);
-		const attemptRecord: AttemptRecord = {
-			attempt: run.attempt,
-			status: attemptStatus,
-			reason,
-			summary: attemptSummary,
-			workerSummary: singleLine(workerSummary, 280),
-			verifierSummary: singleLine(
-				verification.verdict === "MET"
-					? verification.summary
-					: [verification.summary, ...verification.nextActions].join(" "),
-				280,
-			),
-			nextActions: verification.nextActions,
-			verdict: verification.verdict,
-			startedAt: attemptStartedAt,
-			finishedAt: Date.now(),
-		};
-		run.history.push(attemptRecord);
-		latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
-		await appendAttemptRecord(run, attemptRecord);
-		await persistRunSnapshot(run);
-
-		if (verification.verdict === "MET") {
-			finalizeRun(run, `Goal-Driven succeeded: ${verification.summary}`, "info");
-			return;
+	if (Array.isArray(candidate.tasks)) {
+		for (const task of candidate.tasks) {
+			if (!task || typeof task !== "object") continue;
+			(task as Record<string, unknown>).agent = GOAL_DRIVEN_WORKER_AGENT;
 		}
-
-		run.lastActivityAt = Date.now();
-		run.lastEvent = `Criteria not met after attempt #${run.attempt}; restarting.`;
-		refreshUiStatus();
-		notify(
-			`Attempt #${run.attempt} did not meet the criteria. Restarting ${run.agentName}. Reason: ${singleLine(reason, 120)} Verifier: ${singleLine(verification.summary, 120)} Logs: ${run.debugDir}`,
-			"warning",
-		);
 	}
 
-	finalizeRun(run, run.stopReason ?? "Goal-Driven stopped.", "info");
+	if (!Array.isArray(candidate.chain)) return;
+	for (const step of candidate.chain) {
+		if (!step || typeof step !== "object") continue;
+		const chainStep = step as Record<string, unknown>;
+		if (typeof chainStep.agent === "string") {
+			chainStep.agent = GOAL_DRIVEN_WORKER_AGENT;
+		}
+		if (!Array.isArray(chainStep.parallel)) continue;
+		for (const parallelStep of chainStep.parallel) {
+			if (!parallelStep || typeof parallelStep !== "object") continue;
+			(parallelStep as Record<string, unknown>).agent = GOAL_DRIVEN_WORKER_AGENT;
+		}
+	}
 }
 
-function getStatusText(): string {
-	if (activeBrainstorm) {
-		return `Active brainstorm\n${buildBrainstormStatusSummary(activeBrainstorm)}`;
-	}
-	const run = getDisplayRun();
-	if (!run) return "No Goal-Driven run is active.";
-	const prefix = activeRun ? "Active run" : "Last archived run";
-	return `${prefix}\n${buildStatusLines(run).join("\n")}`;
-}
-
-async function prepareRunContext(ctx: ExtensionContext): Promise<PreparedRunContext | null> {
-	if (!(await hasGlobalPiSubagentsInstalled())) {
-		ctx.ui.notify(
-			`Missing global pi-subagents install. Install and enable pi-subagents first (expected either ${GLOBAL_SUBAGENTS_EXTENSION_PATH} or a pi-subagents entry in ${GLOBAL_SETTINGS_PATH}).`,
-			"error",
-		);
-		return null;
-	}
-
-	const discovered = discoverAgents(ctx.cwd, "both").agents;
-	if (discovered.length === 0) {
-		ctx.ui.notify("No pi-subagents agents were found. Install and configure pi-subagents first.", "error");
-		return null;
-	}
-
-	const { config, path: configPath } = await loadGoalDrivenConfig(ctx);
-	if (!ctx.model && !(config.provider && config.model)) {
-		ctx.ui.notify("Select a model before starting Goal-Driven, or configure provider/model in pi-goal-driven config.", "error");
-		return null;
-	}
-
-	const selectedAgent = selectConfiguredAgent(discovered, config.defaultAgent);
-	if (selectedAgent.fallbackUsed) {
-		ctx.ui.notify(
-			`[${EXTENSION_NAME}] Configured defaultAgent '${selectedAgent.requestedName}' was not found in ${configPath}. Using '${selectedAgent.agent.name}'.`,
-			"warning",
-		);
-	}
-
-	return { config, configPath, selectedAgent };
-}
-
-function createRun(
-	setup: SetupResult,
-	ctx: ExtensionContext,
-	config: GoalDrivenConfig,
-	thinkingLevel: string,
-): ActiveRun {
-	const now = Date.now();
+function getSubagentAsyncLaunch(details: unknown): { asyncId: string | null; asyncDir: string | null } {
+	if (!details || typeof details !== "object") return { asyncId: null, asyncDir: null };
+	const candidate = details as Record<string, unknown>;
 	return {
-		goal: setup.goal,
-		criteria: setup.criteria,
-		brainstormSummary: setup.brainstormSummary,
-		filledPrompt: fillPromptTemplate(setup.goal, setup.criteria),
-		cwd: ctx.cwd,
-		modelConfig: buildRunModelConfig(ctx, config),
-		thinkingLevel,
-		startedAt: now,
-		attempt: 0,
-		attemptStartedAt: now,
-		state: "running",
-		lastActivityAt: now,
-		lastEvent: setup.brainstormSummary ? `Preparing Goal-Driven run: ${setup.brainstormSummary}` : "Preparing Goal-Driven run",
-		history: [],
-		dashboardExpanded: false,
-		stopRequested: false,
-		agentName: setup.agentName,
-		debugDir: "",
+		asyncId: typeof candidate.asyncId === "string" ? candidate.asyncId : null,
+		asyncDir: typeof candidate.asyncDir === "string" ? candidate.asyncDir : null,
 	};
 }
 
-async function startGoalDrivenRun(
-	setup: SetupResult,
-	ctx: ExtensionContext,
-	thinkingLevel: string,
-	prepared?: PreparedRunContext,
-): Promise<void> {
-	const preparedContext = prepared ?? await prepareRunContext(ctx);
-	if (!preparedContext) return;
-	const run = createRun(setup, ctx, preparedContext.config, thinkingLevel);
-	run.debugDir = await createRunDebugDir(ctx.cwd);
-	activeRun = run;
-	latestArchivedRun = cloneArchivedRun(toPersistedRunSnapshot(run));
-	await persistRunSnapshot(run);
-	void supervise(run, preparedContext.selectedAgent.agent).catch((error: unknown) => {
-		const message = error instanceof Error ? error.message : String(error);
-		finalizeRun(run, `Goal-Driven crashed: ${message}`, "error");
-	});
+async function readAsyncRunState(asyncDir: string | null): Promise<AsyncRunState | null> {
+	if (!asyncDir) return null;
+	try {
+		const raw = await readFile(path.join(asyncDir, "status.json"), "utf8");
+		const candidate = JSON.parse(raw) as { state?: string };
+		if (
+			candidate.state === "queued"
+			|| candidate.state === "running"
+			|| candidate.state === "complete"
+			|| candidate.state === "failed"
+		) {
+			return candidate.state;
+		}
+		return null;
+	} catch {
+		return null;
+	}
 }
 
-async function collectGoalDrivenInput(ctx: ExtensionContext, agentName: string): Promise<SetupResult | null> {
-	const goal = (await ctx.ui.input("Goal", `Describe what '${agentName}' should accomplish`))?.trim();
-	if (!goal) return null;
-
-	const criteria = (await ctx.ui.input(
-		"Criteria for success",
-		"Describe the observable checks that prove the goal is done",
-	))?.trim();
-	if (!criteria) return null;
-
-	return { goal, criteria, agentName };
+async function findRunningKnownAsyncRun(run: ActiveRun): Promise<KnownAsyncRun | null> {
+	for (let index = run.knownAsyncRuns.length - 1; index >= 0; index -= 1) {
+		const knownRun = run.knownAsyncRuns[index];
+		const state = await readAsyncRunState(knownRun.dir);
+		if (state === "queued" || state === "running") {
+			return knownRun;
+		}
+	}
+	return null;
 }
 
-async function collectBrainstormRequest(ctx: ExtensionContext, initialArgs: string): Promise<string | null> {
-	const inline = initialArgs.trim();
-	if (inline) return inline;
-	const drafted = await ctx.ui.editor(
-		"Goal-Driven brainstorm",
-		"Describe the task, feature, or outcome you want Goal-Driven to execute after we lock the Goal and Criteria for success.",
+function trackKnownAsyncRun(run: ActiveRun, asyncId: string, asyncDir: string | null): void {
+	const existing = run.knownAsyncRuns.find((knownRun) => knownRun.id === asyncId);
+	if (existing) {
+		existing.dir = asyncDir;
+	} else {
+		run.knownAsyncRuns.push({ id: asyncId, dir: asyncDir });
+	}
+	run.latestAsyncId = asyncId;
+	run.latestAsyncDir = asyncDir;
+}
+
+async function stopKnownAsyncRuns(run: ActiveRun, reason = "Stopped by /goal-driven stop"): Promise<number> {
+	let stopped = 0;
+	for (const knownRun of run.knownAsyncRuns) {
+		if (!knownRun.dir) continue;
+		try {
+			const statusPath = path.join(knownRun.dir, "status.json");
+			const raw = await readFile(statusPath, "utf8");
+			const candidate = JSON.parse(raw) as {
+				state?: string;
+				pid?: number;
+				lastUpdate?: number;
+				endedAt?: number;
+				error?: string;
+				steps?: Array<Record<string, unknown>>;
+			};
+			if (candidate.state !== "queued" && candidate.state !== "running") continue;
+
+			const stoppedAt = Date.now();
+			if (typeof candidate.pid === "number") {
+				try {
+					process.kill(candidate.pid, "SIGTERM");
+				} catch {
+					// The process may have already exited; still rewrite status below.
+				}
+			}
+
+			candidate.state = "failed";
+			candidate.lastUpdate = stoppedAt;
+			candidate.endedAt = stoppedAt;
+			candidate.error = reason;
+			candidate.steps = (candidate.steps ?? []).map((step) => {
+				const nextStep = { ...step };
+				if (nextStep.status === "queued" || nextStep.status === "pending" || nextStep.status === "running") {
+					nextStep.status = "failed";
+					nextStep.endedAt = stoppedAt;
+					if (typeof nextStep.startedAt === "number") {
+						nextStep.durationMs = Math.max(0, stoppedAt - nextStep.startedAt);
+					}
+					if (typeof nextStep.error !== "string" || !nextStep.error) {
+						nextStep.error = reason;
+					}
+				}
+				return nextStep;
+			});
+
+			await writeFile(statusPath, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+			stopped += 1;
+		} catch {
+			// Best-effort cleanup; ignore missing, finished, or already-dead runs.
+		}
+	}
+	return stopped;
+}
+
+async function readAsyncRunSnapshot(asyncDir: string | null): Promise<AsyncRunSnapshot | null> {
+	if (!asyncDir) return null;
+	try {
+		const raw = await readFile(path.join(asyncDir, "status.json"), "utf8");
+		const candidate = JSON.parse(raw) as {
+			state?: string;
+			lastUpdate?: number;
+			pid?: number;
+			outputFile?: string;
+		};
+		return {
+			state: candidate.state === "queued"
+				|| candidate.state === "running"
+				|| candidate.state === "complete"
+				|| candidate.state === "failed"
+				? candidate.state
+				: null,
+			lastUpdate: typeof candidate.lastUpdate === "number" ? candidate.lastUpdate : null,
+			pid: typeof candidate.pid === "number" ? candidate.pid : null,
+			outputFile: typeof candidate.outputFile === "string" ? candidate.outputFile : null,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readPathMtime(targetPath: string | null): Promise<number | null> {
+	if (!targetPath) return null;
+	try {
+		return (await stat(targetPath)).mtimeMs;
+	} catch {
+		return null;
+	}
+}
+
+async function getAsyncRunHeartbeatAt(asyncDir: string): Promise<number | null> {
+	const snapshot = await readAsyncRunSnapshot(asyncDir);
+	if (!snapshot) return null;
+	const candidates = [
+		snapshot.lastUpdate,
+		await readPathMtime(path.join(asyncDir, "events.jsonl")),
+		await readPathMtime(snapshot.outputFile),
+	].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+	return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
+function formatInactivity(durationMs: number): string {
+	if (durationMs < 60_000) return `${Math.max(1, Math.floor(durationMs / 1000))}s`;
+	return `${Math.max(1, Math.floor(durationMs / 60_000))}m`;
+}
+
+function stopWatchdog(): void {
+	if (!watchdogTimer) return;
+	clearInterval(watchdogTimer);
+	watchdogTimer = null;
+}
+
+function ensureWatchdog(pi: ExtensionAPI): void {
+	if (watchdogTimer || !activeRun) return;
+	watchdogTimer = setInterval(() => {
+		void watchdogTick(pi);
+	}, WATCHDOG_POLL_MS);
+	watchdogTimer.unref?.();
+}
+
+async function watchdogTick(pi: ExtensionAPI): Promise<void> {
+	const run = activeRun;
+	if (!run) {
+		stopWatchdog();
+		return;
+	}
+	if (run.awaitingVerification) return;
+
+	const runningKnownRun = await findRunningKnownAsyncRun(run);
+	if (!runningKnownRun?.dir) return;
+	if (run.activeAsyncId !== runningKnownRun.id || run.activeAsyncDir !== runningKnownRun.dir) {
+		run.activeAsyncId = runningKnownRun.id;
+		run.activeAsyncDir = runningKnownRun.dir;
+	}
+
+	const snapshot = await readAsyncRunSnapshot(runningKnownRun.dir);
+	if (!snapshot || (snapshot.state !== "queued" && snapshot.state !== "running")) return;
+
+	const heartbeatAt = await getAsyncRunHeartbeatAt(runningKnownRun.dir);
+	if (heartbeatAt === null) return;
+
+	const inactiveForMs = Date.now() - heartbeatAt;
+	if (inactiveForMs < WATCHDOG_INACTIVE_TIMEOUT_MS) return;
+
+	const stoppedWorkers = await stopKnownAsyncRuns(run, WATCHDOG_STOP_REASON);
+	if (stoppedWorkers <= 0) return;
+
+	run.phase = "working";
+	run.awaitingVerification = false;
+	run.verificationReminderSent = false;
+	run.activeAsyncId = null;
+	run.activeAsyncDir = null;
+	run.latestAsyncId = runningKnownRun.id;
+	run.latestAsyncDir = runningKnownRun.dir;
+	run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] inactive for ${formatInactivity(inactiveForMs)}; replacement requested`;
+	refreshStatus();
+	if (latestCtx?.hasUI) {
+		latestCtx.ui.notify(
+			`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was inactive for ${formatInactivity(inactiveForMs)}. Stopped it and requested a replacement worker.`,
+			"warning",
+		);
+	}
+	sendGoalDrivenFollowUp(
+		pi,
+		"The previous worker became inactive and was stopped by the Goal-Driven watchdog. Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
 	);
-	const request = drafted?.trim();
-	return request || null;
 }
 
-async function startGoalDrivenBrainstorm(pi: ExtensionAPI, ctx: ExtensionContext, request: string): Promise<void> {
-	if (activeRun || activeBrainstorm) {
-		ctx.ui.notify(getStatusText(), "info");
+function sendGoalDrivenFollowUp(pi: ExtensionAPI, content: string): void {
+	pi.sendMessage(
+		{
+			customType: EXTENSION_NAME,
+			content,
+			display: false,
+		},
+		{ deliverAs: "followUp", triggerTurn: true },
+	);
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+	return count === 1 ? singular : plural;
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+	try {
+		await access(targetPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function ensureDir(dir: string): Promise<void> {
+	await mkdir(dir, { recursive: true });
+}
+
+function sanitizePathSegment(value: string): string {
+	const sanitized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+	return sanitized || "workspace";
+}
+
+function promptPathForCwd(cwd: string): string {
+	return path.join(GLOBAL_PROMPTS_DIR, sanitizePathSegment(cwd), "latest-prompt.md");
+}
+
+async function loadTemplate(): Promise<string> {
+	return readFile(TEMPLATE_PATH, "utf8");
+}
+
+function fillTemplate(template: string, goal: string, criteria: string): string {
+	return template
+		.replace(GOAL_PLACEHOLDER, goal.trim())
+		.replace(CRITERIA_PLACEHOLDER, criteria.trim());
+}
+
+function parsePromptSections(prompt: string): { goal: string; criteria: string } {
+	const goalMatch = prompt.match(/\nGoal:\s*([\s\S]*?)\n\nCriteria for success:/i);
+	const criteriaMatch = prompt.match(/\nCriteria for success:\s*([\s\S]*?)\n\nHere is the System:/i);
+	return {
+		goal: normalizeGoal(goalMatch?.[1] ?? ""),
+		criteria: normalizeCriteria(criteriaMatch?.[1] ?? ""),
+	};
+}
+
+async function savePrompt(cwd: string, prompt: string): Promise<string> {
+	const targetPath = promptPathForCwd(cwd);
+	await ensureDir(path.dirname(targetPath));
+	await writeFile(targetPath, `${prompt.trim()}\n`, "utf8");
+	return targetPath;
+}
+
+async function loadSavedPrompt(cwd: string): Promise<string | null> {
+	const targetPath = promptPathForCwd(cwd);
+	if (!(await pathExists(targetPath))) return null;
+	return (await readFile(targetPath, "utf8")).trim() || null;
+}
+
+function extractPromptBlock(text: string): string | null {
+	const start = text.indexOf(PROMPT_START);
+	if (start === -1) return null;
+	const end = text.indexOf(PROMPT_END, start + PROMPT_START.length);
+	if (end === -1) return null;
+	const prompt = text.slice(start + PROMPT_START.length, end).trim();
+	return prompt || null;
+}
+
+function refreshStatus(): void {
+	if (!latestCtx?.hasUI) return;
+	if (activeBrainstorm) {
+		latestCtx.ui.setStatus(COMMAND_NAME, `goal-driven:brainstorm ${singleLine(activeBrainstorm.lastEvent, 60)}`);
+		return;
+	}
+	if (activeRun) {
+		latestCtx.ui.setStatus(
+			COMMAND_NAME,
+			`goal-driven:${activeRun.phase} #${activeRun.attempt || 0} ${singleLine(activeRun.lastEvent, 60)}`,
+		);
+		return;
+	}
+	latestCtx.ui.setStatus(COMMAND_NAME, undefined);
+}
+
+function clearBrainstorm(): void {
+	activeBrainstorm = null;
+	refreshStatus();
+}
+
+function clearRun(): void {
+	activeRun = null;
+	stopWatchdog();
+	refreshStatus();
+}
+
+function sendSessionUserMessage(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	text: string,
+	mode: "schedule" | "followUp" = "followUp",
+): void {
+	if (ctx.isIdle()) {
+		pi.sendUserMessage(text);
 		return;
 	}
 
-	const prepared = await prepareRunContext(ctx);
-	if (!prepared) return;
+	if (mode === "followUp") {
+		pi.sendUserMessage(text, { deliverAs: "followUp" });
+		ctx.ui.notify("Queued Goal-Driven message after the current turn.", "info");
+		return;
+	}
 
-	const startedAt = Date.now();
-	activeBrainstorm = {
-		agentName: prepared.selectedAgent.agent.name,
-		initialRequest: request,
-		startedAt,
-		prepared,
-		thinkingLevel: pi.getThinkingLevel(),
-		phase: "starting",
-		lastEvent: "Preparing brainstorm context...",
-		draftPath: brainstormDraftPath(ctx.cwd, startedAt),
+	const trySend = () => {
+		if (ctx.isIdle()) {
+			pi.sendUserMessage(text);
+			return;
+		}
+		setTimeout(trySend, 25);
 	};
-	await persistBrainstormDraft(activeBrainstorm);
-	refreshUiStatus();
-	ctx.ui.notify(`Starting Goal-Driven brainstorm with '${prepared.selectedAgent.agent.name}'...`, "info");
-	pi.sendUserMessage(request.trim());
+	setTimeout(trySend, 0);
+	ctx.ui.notify("Scheduled Goal-Driven message to start as soon as the current command finishes.", "info");
+}
+
+function createEditorTheme(theme: Theme): EditorTheme {
+	return {
+		borderColor: (text) => theme.fg("accent", text),
+		selectList: {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		},
+	};
+}
+
+function renderWizardTabs(theme: Theme, step: number): string {
+	const labels = ["1 Goal", "2 Criteria", "3 Review"];
+	return labels
+		.map((label, index) =>
+			index === step
+				? theme.bg("selectedBg", theme.fg("text", ` ${label} `))
+				: theme.fg("muted", ` ${label} `),
+		)
+		.join(theme.fg("dim", " › "));
+}
+
+async function collectGoalDrivenPromptFallback(
+	ctx: ExtensionCommandContext,
+	template: string,
+): Promise<string | null> {
+	const goal = normalizeGoal(
+		(await ctx.ui.editor(
+			"Goal",
+			"Describe the final outcome the master/subagent system should achieve.",
+		)) ?? "",
+	);
+	if (!goal) return null;
+
+	const criteria = normalizeCriteria(
+		(await ctx.ui.editor(
+			"Criteria for Success",
+			"List the observable checks that prove the goal is done.",
+		)) ?? "",
+	);
+	if (!criteria) return null;
+
+	const draftPrompt = fillTemplate(template, goal, criteria);
+	const reviewedPrompt = (await ctx.ui.editor("Review Goal-Driven prompt", draftPrompt))?.trim();
+	if (!reviewedPrompt) return null;
+	if (hasUnfilledPlaceholders(reviewedPrompt)) {
+		ctx.ui.notify("The reviewed prompt still contains unfilled placeholders. Edit it again or cancel.", "warning");
+		return null;
+	}
+
+	return reviewedPrompt;
+}
+
+async function collectGoalDrivenPrompt(ctx: ExtensionCommandContext): Promise<string | null> {
+	const template = await loadTemplate();
+	const customResult = await ctx.ui.custom<string | null>(
+		(tui, theme, _keybindings, done) => {
+			const editorTheme = createEditorTheme(theme);
+			const goalEditor = new Editor(tui, editorTheme);
+			const criteriaEditor = new Editor(tui, editorTheme);
+			const reviewEditor = new Editor(tui, editorTheme);
+			let step = 0;
+			let cachedLines: string[] | undefined;
+			let errorMessage: string | undefined;
+			let reviewNeedsRefresh = true;
+
+			const clearError = () => {
+				errorMessage = undefined;
+				cachedLines = undefined;
+			};
+
+			const markInputsChanged = () => {
+				reviewNeedsRefresh = true;
+				clearError();
+			};
+
+			goalEditor.onChange = markInputsChanged;
+			criteriaEditor.onChange = markInputsChanged;
+			reviewEditor.onChange = clearError;
+
+			const currentGoal = () => normalizeGoal(goalEditor.getText());
+			const currentCriteria = () => normalizeCriteria(criteriaEditor.getText());
+
+			const syncReviewEditor = () => {
+				if (!reviewNeedsRefresh) return;
+				reviewEditor.setText(fillTemplate(template, currentGoal(), currentCriteria()));
+				reviewNeedsRefresh = false;
+			};
+
+			const setFocus = () => {
+				goalEditor.focused = step === 0;
+				criteriaEditor.focused = step === 1;
+				reviewEditor.focused = step === 2;
+			};
+
+			const refresh = () => {
+				if (step === 2) syncReviewEditor();
+				setFocus();
+				cachedLines = undefined;
+				tui.requestRender();
+			};
+
+			const goToStep = (nextStep: number) => {
+				step = nextStep;
+				errorMessage = undefined;
+				refresh();
+			};
+
+			goalEditor.onSubmit = (value) => {
+				if (!normalizeGoal(value)) {
+					errorMessage = "Goal is required.";
+					refresh();
+					return;
+				}
+				goToStep(1);
+			};
+
+			criteriaEditor.onSubmit = (value) => {
+				if (!normalizeCriteria(value)) {
+					errorMessage = "Criteria for Success is required.";
+					refresh();
+					return;
+				}
+				goToStep(2);
+			};
+
+			reviewEditor.onSubmit = (value) => {
+				const prompt = value.trim();
+				if (!prompt) {
+					errorMessage = "Prompt cannot be empty.";
+					refresh();
+					return;
+				}
+				if (hasUnfilledPlaceholders(prompt)) {
+					errorMessage = "Remove all placeholders before saving.";
+					refresh();
+					return;
+				}
+				done(prompt);
+			};
+
+			const activeEditor = () => (step === 0 ? goalEditor : step === 1 ? criteriaEditor : reviewEditor);
+
+			const handleBack = () => {
+				if (step === 0) {
+					done(null);
+					return;
+				}
+				goToStep(step - 1);
+			};
+
+			const renderStepBody = (width: number): string[] => {
+				const editorWidth = Math.max(24, width - 2);
+				const lines: string[] = [];
+				const add = (text = "") => lines.push(truncateToWidth(text, width));
+
+				if (step === 0) {
+					add(theme.fg("accent", theme.bold("Goal")));
+					add(theme.fg("muted", "Describe the final outcome the master/subagent system should achieve."));
+					add();
+					for (const line of goalEditor.render(editorWidth)) add(` ${line}`);
+					return lines;
+				}
+
+				if (step === 1) {
+					add(theme.fg("accent", theme.bold("Criteria for Success")));
+					add(theme.fg("muted", "List the observable checks that prove the goal is done."));
+					add();
+					for (const line of criteriaEditor.render(editorWidth)) add(` ${line}`);
+					return lines;
+				}
+
+				syncReviewEditor();
+				add(theme.fg("accent", theme.bold("Review Goal-Driven prompt")));
+				add(theme.fg("muted", `Goal: ${singleLine(currentGoal(), 100) || "(empty)"}`));
+				add(theme.fg("muted", `Criteria: ${singleLine(currentCriteria(), 100) || "(empty)"}`));
+				add();
+				for (const line of reviewEditor.render(editorWidth)) add(` ${line}`);
+				return lines;
+			};
+
+			refresh();
+
+			return {
+				render(width: number): string[] {
+					if (cachedLines) return cachedLines;
+					if (step === 2) syncReviewEditor();
+					setFocus();
+
+					const lines: string[] = [];
+					const add = (text = "") => lines.push(truncateToWidth(text, width));
+
+					add(theme.fg("accent", "─".repeat(width)));
+					add(theme.fg("accent", theme.bold(" Goal-Driven Wizard")));
+					add(renderWizardTabs(theme, step));
+					add();
+					lines.push(...renderStepBody(width));
+					add();
+					if (errorMessage) add(theme.fg("warning", errorMessage));
+					const help = step === 0
+						? "Enter continue • Shift+Enter newline • Esc cancel"
+						: step === 1
+							? "Enter continue • Shift+Enter newline • Esc back"
+							: "Enter save • Shift+Enter newline • Esc back";
+					add(theme.fg("dim", help));
+					add(theme.fg("accent", "─".repeat(width)));
+
+					cachedLines = lines;
+					return lines;
+				},
+				invalidate(): void {
+					cachedLines = undefined;
+				},
+				handleInput(data: string): void {
+					if (matchesKey(data, Key.escape)) {
+						handleBack();
+						return;
+					}
+
+					activeEditor().handleInput(data);
+					cachedLines = undefined;
+					tui.requestRender();
+				},
+			};
+		},
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: "92%",
+				maxHeight: "88%",
+				margin: 1,
+			},
+		},
+	);
+
+	if (customResult !== undefined) return customResult;
+	return collectGoalDrivenPromptFallback(ctx, template);
+}
+
+function buildBrainstormSystemPrompt(template: string): string {
+	return `You are running /${BRAINSTORM_COMMAND_NAME}.
+
+Your only job is to help the user fill the Goal-Driven template through normal conversation.
+
+Rules:
+- Do not execute the prompt.
+- Do not call subagent.
+- Do not edit files.
+- Ask at most one focused question at a time, and only when it materially improves Goal or Criteria for Success.
+- If the task is already clear, skip questions and draft the prompt immediately.
+- Whenever you have enough information, return the completed prompt between the exact markers:
+${PROMPT_START}
+<completed prompt>
+${PROMPT_END}
+- If the user asks for revisions, update the prompt and return a fresh completed version with the same markers.
+- Always finish with: Run /${WORK_COMMAND_NAME} to execute it.
+- The completed prompt must not contain placeholder brackets.
+
+Template:
+${template}`;
+}
+
+function buildRunSystemPrompt(run: ActiveRun): string {
+	const phaseInstruction = run.awaitingVerification
+		? `The latest worker subagent attempt has completed. You must verify the workspace and evidence now.`
+		: run.activeAsyncId
+			? `Worker subagent attempt #${run.attempt} is still running in background (async id: ${run.activeAsyncId}). Do not verify yet. Wait for the completion notification before acting again.`
+			: `Launch exactly one worker subagent attempt to continue the run.`;
+
+	return `You are inside an active /${WORK_COMMAND_NAME} Goal-Driven run.
+
+You are the master agent. The worker subagent does implementation work, but the master agent does all verification itself.
+
+Current run state:
+- Attempt count so far: ${run.attempt}
+- Phase: ${run.phase}
+- Active async worker id: ${run.activeAsyncId ?? "none"}
+- Goal:
+${run.goal || "(see saved prompt in conversation)"}
+- Criteria for Success:
+${run.criteria || "(see saved prompt in conversation)"}
+
+Rules:
+- Never create a separate verifier subagent.
+- Use only worker subagents for implementation work.
+- When calling the subagent tool, set agent: "worker" exactly.
+- Do not invent alternate agent names or use descriptive labels in place of the actual agent name.
+- Every worker subagent call must run in background with async: true and clarify: false.
+- An async launch result only means the worker started. It is NOT proof that the task finished.
+- While a worker subagent is running in background, do not verify and do not launch another worker.
+- After a worker completion notification arrives, the master agent must verify the result itself against the Criteria for Success.
+- Treat any unmet or unproven criterion as NOT met.
+- Before ending a message after a worker completion, do exactly one of these:
+  1. If all criteria are fully satisfied and proven, include the exact line:
+     ${MASTER_MET_VERDICT}
+     Then summarize the evidence and do not call subagent again.
+  2. If any criterion is unmet or unproven, create exactly one new worker subagent call to continue the work before ending the message.
+- After launching a background worker, end the message and wait for completion. Do not verify immediately after launch.
+- Do not stop early because the result looks "mostly done".
+- Do not end a verification message without either launching one new worker subagent or emitting ${MASTER_MET_VERDICT}.
+
+Immediate instruction:
+${phaseInstruction}`;
+}
+
+function buildVerificationReminder(run: ActiveRun): string {
+	return [
+		`Master verification is still required for the active Goal-Driven run.`,
+		`Goal:\n${run.goal || "(see saved prompt above)"}`,
+		`Criteria for Success:\n${run.criteria || "(see saved prompt above)"}`,
+		`Use the latest completed worker subagent result already present in the conversation.`,
+		`Before ending your next message, do exactly one of the following:`,
+		`1. If every criterion is fully satisfied and proven, output the exact line: ${MASTER_MET_VERDICT}`,
+		`2. Otherwise create exactly one new worker subagent call with agent: "worker", async: true, and clarify: false to continue the work.`,
+		`Do not create a verifier subagent and do not substitute any other name for the worker agent.`,
+	].join("\n\n");
+}
+
+async function startBrainstorm(pi: ExtensionAPI, ctx: ExtensionCommandContext, args: string): Promise<void> {
+	if (activeBrainstorm || activeRun) {
+		ctx.ui.notify(`A Goal-Driven flow is already active. Run /${COMMAND_NAME} stop first if you want to replace it.`, "warning");
+		return;
+	}
+
+	const template = await loadTemplate();
+	activeBrainstorm = {
+		cwd: ctx.cwd,
+		lastEvent: "Brainstorming Goal and Criteria for Success",
+		template,
+	};
+	refreshStatus();
+
+	const request = args.trim()
+		? `Start /${BRAINSTORM_COMMAND_NAME} for this task:\n\n${args.trim()}`
+		: `Start /${BRAINSTORM_COMMAND_NAME}. Help me fill the Goal-Driven template through conversation. Ask the first focused question only if you need more information.`;
+
+	sendSessionUserMessage(pi, ctx, request);
+	ctx.ui.notify(
+		`Started /${BRAINSTORM_COMMAND_NAME}. Refine the template in chat, then run /${WORK_COMMAND_NAME} when the prompt is ready.`,
+		"info",
+	);
+}
+
+async function runSavedPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	if (activeRun || activeBrainstorm) {
+		ctx.ui.notify(`A Goal-Driven flow is already active. Run /${COMMAND_NAME} stop first if you want to replace it.`, "warning");
+		return;
+	}
+
+	const savedPrompt = await loadSavedPrompt(ctx.cwd);
+	if (!savedPrompt) {
+		ctx.ui.notify(
+			`No saved Goal-Driven prompt found for this workspace. Run /${COMMAND_NAME} or /${BRAINSTORM_COMMAND_NAME} first.`,
+			"warning",
+		);
+		return;
+	}
+
+	const parsed = parsePromptSections(savedPrompt);
+	activeRun = {
+		cwd: ctx.cwd,
+		goal: parsed.goal,
+		criteria: parsed.criteria,
+		attempt: 0,
+		phase: "working",
+		awaitingVerification: false,
+		verificationReminders: 0,
+		verificationReminderSent: false,
+		activeAsyncId: null,
+		activeAsyncDir: null,
+		latestAsyncId: null,
+		latestAsyncDir: null,
+		knownAsyncRuns: [],
+		lastEvent: "Launching master/subagent run",
+	};
+	refreshStatus();
+	ensureWatchdog(pi);
+
+	if (!hasTool(pi, "subagent")) {
+		ctx.ui.notify(
+			"subagent tool not found. /goal-driven:work can still send the prompt, but the run cannot execute as intended without subagent.",
+			"warning",
+		);
+	} else {
+		ensureToolActive(pi, "subagent");
+	}
+
+	sendSessionUserMessage(pi, ctx, savedPrompt, "schedule");
+	ctx.ui.notify(
+		"Started Goal-Driven run. Worker subagents will run in background, show in the async widget, and only trigger master verification after completion.",
+		"info",
+	);
+}
+
+async function stopActiveFlow(ctx: ExtensionCommandContext): Promise<void> {
+	const hadBrainstorm = Boolean(activeBrainstorm);
+	const runToStop = activeRun;
+	const hadRun = Boolean(runToStop);
+	const stoppedWorkers = runToStop ? await stopKnownAsyncRuns(runToStop) : 0;
+	clearBrainstorm();
+	clearRun();
+	if (!ctx.isIdle()) ctx.abort();
+	if (!hadBrainstorm && !hadRun) {
+		ctx.ui.notify("No Goal-Driven flow is active.", "info");
+		return;
+	}
+	ctx.ui.notify(
+		stoppedWorkers > 0
+			? `Stopped the active Goal-Driven flow and sent SIGTERM to ${stoppedWorkers} background ${pluralize(stoppedWorkers, "worker")}.`
+			: "Stopped the active Goal-Driven flow.",
+		"info",
+	);
 }
 
 export default function goalDriven(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", async (event) => {
-		if (!activeBrainstorm) return;
-		activeBrainstorm.phase = "researching";
-		activeBrainstorm.lastEvent = "Understanding the request and current repo context...";
-		await persistBrainstormDraft(activeBrainstorm);
-		refreshUiStatus();
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n${GOAL_DRIVEN_BRAINSTORM_SYSTEM_PROMPT}`,
-		};
-	});
-
-	pi.on("message_update", async (event) => {
-		if (!activeBrainstorm) return;
-		if (!isAssistantMessage(event.message)) return;
-		const assistantText = getAssistantText(event.message).trim();
-		if (assistantText) {
-			activeBrainstorm.lastEvent = singleLine(assistantText, 180);
-		}
-		if (assistantText.includes("If this looks right") || /reply\s+\*{0,2}`?ok`?\*{0,2}/i.test(assistantText)) {
-			activeBrainstorm.phase = "awaiting-confirmation";
-			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
-		} else if (assistantText.includes("Proposed Goal:") || assistantText.includes("Criteria for success:") || assistantText.includes("Goal\n") || assistantText.includes("Goal  ")) {
-			activeBrainstorm.phase = "drafting";
-		}
-		const parsed = parseBrainstormResult(assistantText);
-		if (parsed) {
-			activeBrainstorm.latestDraft = parsed;
-			activeBrainstorm.phase = "awaiting-confirmation";
-			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
-		}
-		await persistBrainstormDraft(activeBrainstorm);
-		refreshUiStatus();
-	});
-
-	pi.on("message_end", async (event, ctx) => {
-		if (!activeBrainstorm) return;
-		if (!isAssistantMessage(event.message)) return;
-		const assistantText = getAssistantText(event.message);
-		if (assistantText.trim()) {
-			activeBrainstorm.lastEvent = singleLine(assistantText, 180);
-		}
-		if (assistantText.includes("If this looks right") || /reply\s+\*{0,2}`?ok`?\*{0,2}/i.test(assistantText)) {
-			activeBrainstorm.phase = "awaiting-confirmation";
-			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
-		}
-		const parsed = parseBrainstormResult(assistantText);
-		if (parsed) {
-			activeBrainstorm.latestDraft = parsed;
-			activeBrainstorm.phase = "awaiting-confirmation";
-			activeBrainstorm.lastEvent = "Draft ready. Reply in chat with feedback or `ok` to launch Goal-Driven.";
-		}
-		await persistBrainstormDraft(activeBrainstorm);
-		refreshUiStatus();
-	});
-
-	pi.on("input", async (event, ctx) => {
-		if (!activeBrainstorm) return;
-		if (event.source !== "interactive") return;
-		const reply = event.text.trim();
-		if (reply.startsWith("/")) return;
-		if (reply.toLowerCase() === "ok") {
-			const draft = activeBrainstorm.latestDraft;
-			if (!draft) {
-				activeBrainstorm.lastEvent = "Still waiting for a draft before confirmation can start Goal-Driven.";
-				await persistBrainstormDraft(activeBrainstorm);
-				refreshUiStatus();
-				ctx.ui.notify("No Goal / Criteria draft is ready yet. Wait for the draft, then reply with ok.", "warning");
-				return { action: "handled" };
-			}
-			const state = activeBrainstorm;
-			activeBrainstorm = null;
-			refreshUiStatus();
-			ctx.ui.notify("Confirmed. Starting Goal-Driven…", "info");
-			await startGoalDrivenRun(
-				{
-					goal: draft.goal,
-					criteria: draft.criteria,
-					agentName: state.agentName,
-					brainstormSummary: draft.summary,
-				},
-				ctx,
-				state.thinkingLevel,
-				state.prepared,
-			);
-			return { action: "handled" };
-		}
-		return { action: "continue" };
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
-		latestArchivedRun = await restoreLatestArchivedRun(ctx.cwd);
-		refreshUiStatus();
+		refreshStatus();
 	});
 
 	pi.on("session_shutdown", async () => {
 		activeBrainstorm = null;
-		refreshUiStatus();
-		if (activeRun) {
-			requestStop("Pi session ended.");
-			finalizeRun(activeRun);
-		}
+		activeRun = null;
+		stopWatchdog();
 		latestCtx = null;
 	});
 
-	pi.registerCommand(`${COMMAND_NAME}:setup`, {
-		description: `Copy the default ${EXTENSION_NAME} config to ${GLOBAL_CONFIG_PATH}`,
-		handler: async (_args, ctx) => {
-			if (await pathExists(GLOBAL_CONFIG_PATH)) {
-				ctx.ui.notify(`[${EXTENSION_NAME}] Config already exists at ${GLOBAL_CONFIG_PATH}`, "warning");
+	pi.on("before_agent_start", async (event) => {
+		if (activeBrainstorm) {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${buildBrainstormSystemPrompt(activeBrainstorm.template)}`,
+			};
+		}
+		if (activeRun) {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${buildRunSystemPrompt(activeRun)}`,
+			};
+		}
+	});
+
+	pi.on("tool_call", async (event) => {
+		if (!activeRun || event.toolName !== "subagent") return;
+		if (!isSubagentExecutionInput(event.input)) return;
+
+		const runningKnownRun = await findRunningKnownAsyncRun(activeRun);
+		if (runningKnownRun) {
+			activeRun.phase = "working";
+			activeRun.awaitingVerification = false;
+			activeRun.verificationReminderSent = false;
+			activeRun.activeAsyncId = runningKnownRun.id;
+			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
+			refreshStatus();
+			return { block: true, reason: `Goal-Driven worker ${runningKnownRun.id} is still running in background.` };
+		}
+
+		activeRun.activeAsyncId = null;
+		activeRun.activeAsyncDir = null;
+		forceGoalDrivenSubagentExecution(event.input);
+		activeRun.attempt += 1;
+		activeRun.phase = "working";
+		activeRun.awaitingVerification = false;
+		activeRun.verificationReminderSent = false;
+		activeRun.lastEvent = `Worker subagent attempt #${activeRun.attempt} launching in background`;
+		refreshStatus();
+	});
+
+	pi.on("tool_result", async (event, _ctx) => {
+		if (!activeRun || event.toolName !== "subagent") return;
+		if (!isSubagentExecutionInput(event.input)) return;
+		const launch = getSubagentAsyncLaunch(event.details);
+		if (!launch.asyncId) {
+			activeRun.phase = "working";
+			activeRun.awaitingVerification = false;
+			activeRun.verificationReminderSent = false;
+			activeRun.activeAsyncId = null;
+			activeRun.activeAsyncDir = null;
+			activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} failed to launch in async mode`;
+			refreshStatus();
+			sendGoalDrivenFollowUp(
+				pi,
+				"The previous worker did not launch in async mode. Launch exactly one replacement worker subagent with async: true and clarify: false, then stop.",
+			);
+			return;
+		}
+		trackKnownAsyncRun(activeRun, launch.asyncId, launch.asyncDir);
+		activeRun.phase = "working";
+		activeRun.awaitingVerification = false;
+		activeRun.verificationReminderSent = false;
+		activeRun.activeAsyncId = launch.asyncId;
+		activeRun.activeAsyncDir = launch.asyncDir;
+		activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} running in background [${launch.asyncId.slice(0, 6)}]`;
+		refreshStatus();
+		ensureWatchdog(pi);
+	});
+
+	pi.events.on("subagent:complete", (data: unknown) => {
+		if (!activeRun) return;
+		const result = data as { id?: string; success?: boolean; asyncDir?: string; summary?: string };
+		if (!result.id) return;
+		const matchesActive = result.id === activeRun.activeAsyncId;
+		const matchesLatest = result.id === activeRun.latestAsyncId;
+		if (!matchesActive && !matchesLatest) return;
+		activeRun.phase = "verifying";
+		activeRun.awaitingVerification = true;
+		activeRun.verificationReminders = 0;
+		activeRun.verificationReminderSent = false;
+		activeRun.activeAsyncId = null;
+		activeRun.activeAsyncDir = result.asyncDir ?? activeRun.latestAsyncDir ?? activeRun.activeAsyncDir;
+		activeRun.latestAsyncId = result.id;
+		activeRun.latestAsyncDir = result.asyncDir ?? activeRun.latestAsyncDir;
+		activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} ${result.success === false ? "failed" : "completed"}; master verifying`;
+		refreshStatus();
+		pi.sendMessage(
+			{
+				customType: EXTENSION_NAME,
+				content: [
+					`Goal-Driven worker attempt #${Math.max(activeRun.attempt, 1)} ${result.success === false ? "failed" : "completed"}.`,
+					result.summary ? "" : undefined,
+					result.summary,
+				].filter((line) => line !== undefined).join("\n"),
+				display: false,
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+	});
+
+	pi.on("message_update", async (event) => {
+		if (!activeBrainstorm || !isAssistantMessage(event.message)) return;
+		const text = getAssistantText(event.message).trim();
+		if (!text) return;
+		activeBrainstorm.lastEvent = text.includes(PROMPT_START)
+			? "Drafted a Goal-Driven prompt"
+			: singleLine(text, 100);
+		refreshStatus();
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (!isAssistantMessage(event.message)) return;
+		const text = getAssistantText(event.message);
+
+		if (activeBrainstorm) {
+			if (text.trim()) {
+				activeBrainstorm.lastEvent = text.includes(PROMPT_START)
+					? "Drafted a Goal-Driven prompt"
+					: singleLine(text, 100);
+			}
+
+			const prompt = extractPromptBlock(text);
+			if (!prompt) {
+				refreshStatus();
 				return;
 			}
 
-			await copyBundledConfig(GLOBAL_CONFIG_PATH);
-			ctx.ui.notify(`[${EXTENSION_NAME}] Config copied to ${GLOBAL_CONFIG_PATH}`, "info");
-		},
+			if (hasUnfilledPlaceholders(prompt)) {
+				ctx.ui.notify(
+					"The generated prompt still contains unfilled placeholders. Continue the conversation or regenerate it.",
+					"warning",
+				);
+				refreshStatus();
+				return;
+			}
+
+			const savePath = await savePrompt(activeBrainstorm.cwd, prompt);
+			clearBrainstorm();
+			ctx.ui.notify(
+				`Saved the completed Goal-Driven prompt to ${savePath}. Run /${WORK_COMMAND_NAME} to execute it.`,
+				"info",
+			);
+			return;
+		}
+
+		if (!activeRun) return;
+
+		if (hasMetVerdict(text)) {
+			const completedRun = activeRun;
+			const stoppedWorkers = await stopKnownAsyncRuns(completedRun);
+			clearRun();
+			ctx.ui.notify(
+				stoppedWorkers > 0
+					? `Goal-Driven run met criteria after ${completedRun.attempt} ${pluralize(completedRun.attempt, "worker attempt")} and stopped ${stoppedWorkers} stale background ${pluralize(stoppedWorkers, "worker")}.`
+					: `Goal-Driven run met criteria after ${completedRun.attempt} ${pluralize(completedRun.attempt, "worker attempt")}.`,
+				"info",
+			);
+			return;
+		}
+
+		if (!activeRun.awaitingVerification) return;
+
+		const runningKnownRun = await findRunningKnownAsyncRun(activeRun);
+		if (runningKnownRun) {
+			activeRun.awaitingVerification = false;
+			activeRun.verificationReminderSent = false;
+			activeRun.phase = "working";
+			activeRun.activeAsyncId = runningKnownRun.id;
+			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
+			refreshStatus();
+			return;
+		}
+
+		if (assistantMessageHasSubagentExecutionCall(event.message)) {
+			activeRun.awaitingVerification = false;
+			activeRun.verificationReminderSent = false;
+			activeRun.phase = "working";
+			activeRun.lastEvent = `Master requested another worker attempt after verification`;
+			refreshStatus();
+			return;
+		}
+
+		activeRun.verificationReminders += 1;
+		activeRun.lastEvent = `Master verification incomplete; reminder #${activeRun.verificationReminders}`;
+		refreshStatus();
+		if (activeRun.verificationReminderSent) return;
+		activeRun.verificationReminderSent = true;
+		sendGoalDrivenFollowUp(pi, buildVerificationReminder(activeRun));
 	});
 
 	pi.registerCommand(BRAINSTORM_COMMAND_NAME, {
-		description: "Brainstorm Goal + Criteria for success, then start Goal-Driven automatically",
+		description: "Fill the Goal-Driven template through normal conversation, then save the prompt",
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
-			const request = await collectBrainstormRequest(ctx, args);
-			if (!request) {
-				ctx.ui.notify("Goal-Driven brainstorm cancelled.", "info");
-				return;
-			}
-			await startGoalDrivenBrainstorm(pi, ctx, request);
+			await startBrainstorm(pi, ctx, args);
+		},
+	});
+
+	pi.registerCommand(WORK_COMMAND_NAME, {
+		description: "Execute the latest saved Goal-Driven prompt in the current session",
+		handler: async (_args, ctx) => {
+			latestCtx = ctx;
+			await runSavedPrompt(pi, ctx);
 		},
 	});
 
 	pi.registerCommand(COMMAND_NAME, {
-		description: "Start or manage a Goal-Driven master/subagent run",
+		description: "Collect Goal and Criteria for Success locally, or run Goal-Driven shortcuts",
 		getArgumentCompletions(prefix) {
-			return ["brainstorm", "setup", "status", "stop"]
+			return ["brainstorm", "work", "stop"]
 				.filter((item) => item.startsWith(prefix))
-				.map((item) => ({
-					value: item,
-					label: item === "brainstorm" ? `${item} (same as /${BRAINSTORM_COMMAND_NAME})` : item,
-				}));
+				.map((item) => ({ value: item, label: item }));
 		},
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
 			const action = args.trim().toLowerCase();
 
 			if (action === "brainstorm") {
-				const request = await collectBrainstormRequest(ctx, "");
-				if (!request) {
-					ctx.ui.notify("Goal-Driven brainstorm cancelled.", "info");
-					return;
-				}
-				await startGoalDrivenBrainstorm(pi, ctx, request);
+				await startBrainstorm(pi, ctx, "");
 				return;
 			}
 
-			if (action === "setup") {
-				if (await pathExists(GLOBAL_CONFIG_PATH)) {
-					ctx.ui.notify(`[${EXTENSION_NAME}] Config already exists at ${GLOBAL_CONFIG_PATH}`, "warning");
-					return;
-				}
-
-				await copyBundledConfig(GLOBAL_CONFIG_PATH);
-				ctx.ui.notify(`[${EXTENSION_NAME}] Config copied to ${GLOBAL_CONFIG_PATH}`, "info");
-				return;
-			}
-
-			if (action === "status") {
-				ctx.ui.notify(getStatusText(), "info");
+			if (action === "work") {
+				await runSavedPrompt(pi, ctx);
 				return;
 			}
 
 			if (action === "stop") {
-				if (activeBrainstorm) {
-					activeBrainstorm = null;
-					refreshUiStatus();
-					ctx.ui.notify("Stopping Goal-Driven brainstorm...", "info");
-					return;
-				}
-				if (!requestStop("Stopped by user.")) {
-					ctx.ui.notify("No Goal-Driven run is active.", "info");
-					return;
-				}
-				ctx.ui.notify("Stopping Goal-Driven run...", "info");
+				await stopActiveFlow(ctx);
 				return;
 			}
 
 			if (action.length > 0) {
-				ctx.ui.notify(
-					"Usage: /goal-driven, /goal-driven brainstorm, /goal-driven:brainstorm, /goal-driven setup, /goal-driven status, or /goal-driven stop",
-					"warning",
-				);
+				ctx.ui.notify(`Usage: ${USAGE_TEXT}`, "warning");
 				return;
 			}
 
 			if (activeRun || activeBrainstorm) {
-				ctx.ui.notify(getStatusText(), "info");
+				ctx.ui.notify(`A Goal-Driven flow is already active. Run /${COMMAND_NAME} stop first if you want to replace it.`, "warning");
 				return;
 			}
 
-			const prepared = await prepareRunContext(ctx);
-			if (!prepared) return;
-
-			const setup = await collectGoalDrivenInput(ctx, prepared.selectedAgent.agent.name);
-			if (!setup) {
-				ctx.ui.notify("Goal-Driven start cancelled.", "info");
+			const prompt = await collectGoalDrivenPrompt(ctx);
+			if (!prompt) {
+				ctx.ui.notify("Goal-Driven prompt collection cancelled.", "info");
 				return;
 			}
 
-			await startGoalDrivenRun(setup, ctx, pi.getThinkingLevel(), prepared);
-		},
-	});
-
-	pi.registerShortcut("ctrl+x", {
-		description: "Toggle Goal-Driven experiment dashboard",
-		handler: async (ctx) => {
-			latestCtx = ctx;
-			const run = getDisplayRun();
-			if (!run) {
-				ctx.ui.notify("No Goal-Driven run is active.", "info");
-				return;
-			}
-			run.dashboardExpanded = !run.dashboardExpanded;
-			if (activeRun) refreshUiStatus();
-			else ctx.ui.notify(getStatusText(), "info");
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+x", {
-		description: "Open fullscreen Goal-Driven experiment dashboard",
-		handler: async (ctx) => {
-			latestCtx = ctx;
-			const run = getDisplayRun();
-			if (!run) {
-				ctx.ui.notify("No Goal-Driven run is active.", "info");
-				return;
-			}
-
-			await ctx.ui.custom<void>(
-				(tui, theme, _keybindings, done) => {
-					let scrollOffset = 0;
-					let lastViewportRows = 8;
-					let lastTotalRows = 0;
-					const timer = setInterval(() => tui.requestRender(), 120);
-
-					return {
-						render(width: number): string[] {
-							const safeWidth = Math.max(1, width || getTuiSize(tui).width);
-							const viewportRows = Math.max(8, getTuiSize(tui).height - 4);
-							const overlay = renderFullscreenOverlayLines(run, theme, safeWidth, viewportRows, scrollOffset);
-							lastTotalRows = overlay.totalRows;
-							lastViewportRows = Math.max(1, viewportRows - 1);
-							const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
-							scrollOffset = clamp(scrollOffset, 0, maxScroll);
-							return overlay.lines;
-						},
-						handleInput(data: string): void {
-							const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
-							if (matchesKey(data, "escape") || data === "q") {
-								done(undefined);
-								return;
-							}
-							if (matchesKey(data, "up") || data === "k") scrollOffset = Math.max(0, scrollOffset - 1);
-							else if (matchesKey(data, "down") || data === "j") scrollOffset = Math.min(maxScroll, scrollOffset + 1);
-							else if (matchesKey(data, "pageUp") || data === "u") scrollOffset = Math.max(0, scrollOffset - lastViewportRows);
-							else if (matchesKey(data, "pageDown") || data === "d") scrollOffset = Math.min(maxScroll, scrollOffset + lastViewportRows);
-							else if (data === "g") scrollOffset = 0;
-							else if (data === "G") scrollOffset = maxScroll;
-							tui.requestRender();
-						},
-						invalidate(): void {},
-						dispose(): void {
-							clearInterval(timer);
-						},
-					};
-				},
-				{
-					overlay: true,
-					overlayOptions: {
-						width: "92%",
-						maxHeight: "88%",
-						anchor: "center" as const,
-						margin: 1,
-					},
-				},
+			const savePath = await savePrompt(ctx.cwd, prompt);
+			ctx.ui.notify(
+				`Saved the completed Goal-Driven prompt to ${savePath}. Run /${WORK_COMMAND_NAME} to execute it.`,
+				"info",
 			);
 		},
 	});
