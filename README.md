@@ -6,10 +6,12 @@
 
 A minimal Pi extension for running a Goal-Driven master/worker workflow from a reusable template, with worker execution aligned to the `pi-subagents` async runtime.
 
+https://github.com/user-attachments/assets/da5a59bd-7ea8-4a65-a9bb-490461cf5daf
+
 ## Version notes
 
 - Previous version on `origin/master`: `0.2.0`
-- Current version in this codebase: `0.4.1`
+- Current version in this codebase: `0.5.0`
 - Detailed release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## What it does
@@ -54,7 +56,7 @@ Examples:
 
 ```text
 /goal-driven:brainstorm
-/goal-driven:brainstorm Rebuild the issue detail page to match the multica reference exactly
+/goal-driven:brainstorm 新建 results.txt 文件，写入三行 alpha, beta, foo
 ```
 
 When Pi has enough information, it returns a completed template prompt, the extension saves it, and you can run:
@@ -71,7 +73,7 @@ This is the execution step.
 
 The prompt that gets sent is your filled Goal-Driven template, so Pi can run the master-agent behavior directly in the current conversation.
 
-In `0.4.1`, worker execution is aligned to `pi-subagents` background execution:
+In `0.5.0`, worker execution is aligned to `pi-subagents` background execution:
 
 - worker `subagent` calls are forced to `async: true`
 - worker `subagent` calls are forced to `clarify: false`
@@ -207,19 +209,33 @@ What happens next:
 - when the worker finishes, the master verifies the criteria
 - if anything is still missing, another worker attempt is launched automatically
 
-### Example 2: complex
+### Example 2: brainstormed
 
-Use this when the task needs clarification, scoping, or stronger acceptance criteria before execution.
+Use this when you want chat-based refinement to turn a short request into a precise Goal-Driven prompt before execution.
 
 ```text
-/goal-driven:brainstorm Rebuild the issue detail page to match the latest design exactly, preserve existing data behavior, and verify the final UI against the acceptance criteria before stopping.
+/goal-driven:brainstorm 新建 results.txt 文件，写入三行 alpha, beta, foo
 ```
 
 Typical result of the brainstorm phase:
 
-- Pi asks for missing constraints if needed
-- Pi drafts a complete Goal-Driven prompt
+- Pi rewrites the request into a concrete Goal
+- Pi expands the task into explicit, verifiable success criteria
 - the prompt is saved for the current workspace
+
+For this example, a typical generated prompt looks like:
+
+```text
+Goal: 在仓库根目录新建 `results.txt` 文件，并使其内容恰好为三行：`alpha`、`beta`、`foo`，每个值各占一行且顺序一致。
+
+Criteria for success:
+1. 工作区中存在文件 `results.txt`。
+2. `results.txt` 的第 1 行是 `alpha`。
+3. `results.txt` 的第 2 行是 `beta`。
+4. `results.txt` 的第 3 行是 `foo`。
+5. `results.txt` 除这三行外不包含任何额外内容。
+6. 主代理亲自读取并验证 `results.txt` 的内容与以上要求完全一致后，才可判定完成。
+```
 
 Then execute:
 
@@ -227,15 +243,12 @@ Then execute:
 /goal-driven:work
 ```
 
-A good complex run usually includes criteria like:
+What happens next:
 
-```text
-1. The issue detail page layout matches the target design in structure and spacing.
-2. Existing data loading and issue actions still work.
-3. Typecheck passes.
-4. The master agent verifies the implemented result after worker completion.
-5. The run only stops when every criterion is proven.
-```
+- the worker starts in background via `pi-subagents`
+- the master waits for that worker to finish
+- the master reads `results.txt` directly instead of trusting the worker's self-report
+- the run ends only after the master can output `GOAL_DRIVEN_VERDICT: MET`
 
 ## Design goal
 
