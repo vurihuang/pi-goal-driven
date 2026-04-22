@@ -2,6 +2,57 @@
 
 All notable changes to `pi-goal-driven` are documented here.
 
+## Unreleased - 2026-04-22
+
+### Summary
+
+This update significantly improves `/goal-driven:brainstorm` so it produces stronger, more stable **Goal** and **Criteria for success** prompts before execution.
+
+The work was developed through a multi-round optimization loop using `pi-autoresearch`, with repeated blind-workload benchmarking to improve real prompt-shaping quality while avoiding benchmark overfitting.
+
+### Changed
+
+- `/goal-driven:brainstorm` is now more disciplined about staying in **brainstorm mode**.
+  - It is explicitly guided to shape the prompt, not start implementing the task.
+  - It avoids drifting into file creation, code generation, command output, or other implementation behavior during the brainstorm phase.
+- Brainstorm questioning is now more selective.
+  - The assistant is guided to ask only the **single highest-value clarification question** when multiple questions are possible.
+  - It prioritizes externally verifiable outcomes, preserved behavior, compatibility constraints, reversibility, required checks, and the observable definition of done.
+- Brainstorm convergence is more reliable after the user answers.
+  - If the user has already provided enough constraints, the assistant is now more likely to draft the completed prompt instead of continuing a clarification loop.
+  - Additional guardrails reduce repeated follow-up questions such as “one more question” / “one more detail” style loops after a sufficient answer.
+- Saved brainstorm prompts are now more canonical.
+  - Prompt parsing and normalization were improved so saved prompts stay closer to the published `goal-driven-template.md` structure.
+  - This reduces prompt pollution and improves consistency of the saved `latest-prompt.md` artifact.
+- The canonical template itself was simplified and aligned more closely with the real runtime behavior.
+  - It now reflects the actual **master + single worker** execution model.
+  - Older boilerplate that no longer matched the runtime was removed.
+
+### Optimization process
+
+This release was refined through `pi-autoresearch` rather than a single manual edit.
+
+The optimization loop included:
+
+- repeated real SDK-driven `/goal-driven:brainstorm` runs
+- blind and progressively harder workload expansion
+- saved-artifact evaluation instead of raw message-only evaluation
+- template-fidelity measurement
+- repeat-sampled benchmarking to reduce LLM and judge noise
+- multiple discard/crash iterations to eliminate regressions and unstable prompt tweaks
+
+### Why this version was chosen
+
+This version was selected because it delivered the best balance of:
+
+- stronger prompt quality
+- fewer unnecessary clarification loops
+- higher saved-prompt consistency
+- better robustness across blind workloads
+- lower risk of benchmark-specific overfitting
+
+Several more aggressive prompt tweaks were tested and intentionally discarded because they improved isolated cases while hurting broader robustness.
+
 ## 0.4.1 - 2026-04-21
 
 **Version mapping**
