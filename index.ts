@@ -62,6 +62,8 @@ interface ActiveBrainstorm {
 	cwd: string;
 	lastEvent: string;
 	template: string;
+	userReplyCount: number;
+	autoDraftNudgeSent: boolean;
 }
 
 interface KnownAsyncRun {
@@ -754,12 +756,20 @@ function fillTemplate(template: string, goal: string, criteria: string): string 
 }
 
 function parsePromptSections(prompt: string): { goal: string; criteria: string } {
-	const goalMatch = prompt.match(/\nGoal:\s*([\s\S]*?)\n\nCriteria for success:/i);
-	const criteriaMatch = prompt.match(/\nCriteria for success:\s*([\s\S]*?)\n\nHere is the System:/i);
+	const goalMatch = prompt.match(/(?:^|\n)Goal:\s*([\s\S]*?)(?:\n\s*\n)Criteria for success:/i);
+	const criteriaMatch = prompt.match(/(?:^|\n)Criteria for success:\s*([\s\S]*?)(?:\n\s*\n)Here is the System:/i);
 	return {
 		goal: normalizeGoal(goalMatch?.[1] ?? ""),
 		criteria: normalizeCriteria(criteriaMatch?.[1] ?? ""),
 	};
+}
+
+function sanitizeBrainstormPrompt(prompt: string, template: string): string | null {
+	const parsed = parsePromptSections(prompt);
+	if (!parsed.goal || !parsed.criteria) return null;
+	const rebuilt = fillTemplate(template, parsed.goal, parsed.criteria).trim();
+	if (hasUnfilledPlaceholders(rebuilt)) return null;
+	return rebuilt;
 }
 
 async function savePrompt(cwd: string, prompt: string): Promise<string> {
@@ -803,6 +813,49 @@ function refreshStatus(): void {
 function clearBrainstorm(): void {
 	activeBrainstorm = null;
 	refreshStatus();
+}
+
+function shouldAutoDraftBrainstorm(text: string, brainstorm: ActiveBrainstorm): boolean {
+	if (brainstorm.autoDraftNudgeSent || brainstorm.userReplyCount < 1) return false;
+	const normalized = text.toLowerCase();
+	if (normalized.includes(PROMPT_START.toLowerCase())) return false;
+	const repeatQuestionSignals = [
+		"one more",
+		"one final",
+		"one quick",
+		"one more clarification",
+		"one more question",
+		"final clarification",
+		"another question",
+		"good. one clarifying question",
+		"one clarifying question about verification",
+		"one focused question about verification",
+		"let me confirm one detail",
+		"one detail",
+		"one last detail",
+		"one quick detail",
+		"to confirm one detail",
+	];
+	if (repeatQuestionSignals.some((signal) => normalized.includes(signal))) return true;
+	const answerProvidedEnoughConstraints = [
+		"good constraints",
+		"perfect. i have enough",
+		"i have enough to draft",
+		"i have what i need",
+		"that helps",
+	].some((signal) => normalized.includes(signal));
+	if (!answerProvidedEnoughConstraints) return false;
+	const highSignalFollowUp = [
+		"what should",
+		"which ",
+		"where does",
+		"where is",
+		"how will",
+		"what is the source of truth",
+		"what is your source of truth",
+		"what does",
+	].some((signal) => normalized.includes(signal));
+	return highSignalFollowUp;
 }
 
 function clearRun(): void {
@@ -1090,12 +1143,27 @@ Rules:
 - Do not execute the prompt.
 - Do not call subagent.
 - Do not edit files.
+- Do not create implementation files, commands, patches, or code samples for the task itself. Your output here is only the completed Goal-Driven prompt.
+- If information is still missing, ask for it or draft a prompt that makes the remaining uncertainty explicit. Never switch into implementation mode during brainstorm.
 - Ask at most one focused question at a time, and only when it materially improves Goal or Criteria for Success.
+- When several clarifications are possible, ask only the single highest-value question — the one most likely to unlock a strong Goal and testable Criteria for Success.
+- Prefer questions that uncover output format, preserved behavior, compatibility constraints, reversibility, required checks, scope boundaries, or the observable definition of done.
+- A strong default first question is some form of: what would make this done, and what must stay unchanged?
+- Prefer asking about externally visible results and verification first. Avoid spending the first question on implementation internals like schema column names, storage layout, or where a design artifact lives if the worker can inspect those during execution.
 - If the task is already clear, skip questions and draft the prompt immediately.
+- If the user gives concrete success criteria or constraints, treat that as enough to draft even if they did not directly answer your exact question, unless a missing detail would still make the final output contract unknowable.
+- After the user answers a clarifying question, prefer drafting the completed prompt instead of asking another question unless the missing detail would still force the worker to guess the core task contract.
+- Do not repeat the same question in different words. If the user answers with adjacent constraints, incorporate them and move forward.
+- If some low-priority detail is still unknown, draft the prompt anyway and write success criteria around what is observable and user-confirmed.
+- The Goal should describe the desired end state, not the implementation plan.
+- Criteria for success should be a numbered list of observable, testable checks.
+- Explicitly capture user-stated constraints such as preserving existing behavior, tests or typecheck, no new dependencies, compatibility windows, reversibility, or output format when they matter.
+- Avoid filler criteria like "production-ready", "handle edge cases gracefully", or deployment steps unless the user explicitly asked for them.
 - Whenever you have enough information, return the completed prompt between the exact markers:
 ${PROMPT_START}
 <completed prompt>
 ${PROMPT_END}
+- Reuse the template's Goal / Criteria for success / Here is the System section labels so the saved prompt stays easy to parse.
 - If the user asks for revisions, update the prompt and return a fresh completed version with the same markers.
 - Always finish with: Run /${WORK_COMMAND_NAME} to execute it.
 - The completed prompt must not contain placeholder brackets.
@@ -1175,6 +1243,8 @@ async function startBrainstorm(pi: ExtensionAPI, ctx: ExtensionCommandContext, a
 		cwd: ctx.cwd,
 		lastEvent: "Brainstorming Goal and Criteria for Success",
 		template,
+		userReplyCount: 0,
+		autoDraftNudgeSent: false,
 	};
 	refreshStatus();
 
@@ -1417,8 +1487,13 @@ export default function goalDriven(pi: ExtensionAPI): void {
 	});
 
 	pi.on("message_end", async (event, ctx) => {
-		if (!isAssistantMessage(event.message)) return;
-		const text = getAssistantText(event.message);
+		const assistantMessage = isAssistantMessage(event.message) ? event.message : null;
+		if (activeBrainstorm && event.message.role === "user") {
+			activeBrainstorm.userReplyCount += 1;
+			refreshStatus();
+		}
+		if (!assistantMessage) return;
+		const text = getAssistantText(assistantMessage);
 
 		if (activeBrainstorm) {
 			if (text.trim()) {
@@ -1429,6 +1504,13 @@ export default function goalDriven(pi: ExtensionAPI): void {
 
 			const prompt = extractPromptBlock(text);
 			if (!prompt) {
+				if (shouldAutoDraftBrainstorm(text, activeBrainstorm)) {
+					activeBrainstorm.autoDraftNudgeSent = true;
+					sendGoalDrivenFollowUp(
+						pi,
+						`You already have enough information to draft a strong Goal and Criteria for Success. Do not ask another clarifying question. Produce the completed prompt now between ${PROMPT_START} and ${PROMPT_END}, reusing the template's canonical section labels.`,
+					);
+				}
 				refreshStatus();
 				return;
 			}
@@ -1442,7 +1524,17 @@ export default function goalDriven(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const savePath = await savePrompt(activeBrainstorm.cwd, prompt);
+			const sanitizedPrompt = sanitizeBrainstormPrompt(prompt, activeBrainstorm.template);
+			if (!sanitizedPrompt) {
+				ctx.ui.notify(
+					"The generated prompt could not be normalized back into the canonical Goal-Driven template. Continue the conversation or regenerate it.",
+					"warning",
+				);
+				refreshStatus();
+				return;
+			}
+
+			const savePath = await savePrompt(activeBrainstorm.cwd, sanitizedPrompt);
 			clearBrainstorm();
 			ctx.ui.notify(
 				`Saved the completed Goal-Driven prompt to ${savePath}. Run /${WORK_COMMAND_NAME} to execute it.`,
@@ -1481,7 +1573,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (assistantMessageHasSubagentExecutionCall(event.message)) {
+		if (assistantMessageHasSubagentExecutionCall(assistantMessage)) {
 			activeRun.awaitingVerification = false;
 			activeRun.verificationReminderSent = false;
 			activeRun.phase = "working";
@@ -1573,6 +1665,10 @@ export const __goalDrivenTestUtils = {
 	getSessionTreeRoot,
 	formatAsyncRunCleanupSummary,
 	formatScopedSubagentStatusList,
+	sanitizeBrainstormPrompt,
+	parsePromptSections,
+	shouldAutoDraftBrainstorm,
+	buildBrainstormSystemPrompt,
 	buildRunSystemPrompt,
 	buildVerificationReminder,
 };

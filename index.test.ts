@@ -137,3 +137,80 @@ test("buildRunSystemPrompt and verification reminder emphasize session-tree scop
 	assert.match(reminder, /Only workers from this Goal-Driven session tree count/);
 	assert.match(reminder, /Use the latest completed worker subagent result from this session tree/);
 });
+
+test("buildBrainstormSystemPrompt prefers drafting after one useful clarification", () => {
+	const prompt = __goalDrivenTestUtils.buildBrainstormSystemPrompt("Goal: [[[[[DEFINE YOUR GOAL HERE]]]]]\n\nCriteria for success: [[[[[DEFINE YOUR CRITERIA FOR SUCCESS HERE]]]]]\n\nHere is the System: ...");
+	assert.match(prompt, /single highest-value question/i);
+	assert.match(prompt, /A strong default first question is some form of: what would make this done, and what must stay unchanged/i);
+	assert.match(prompt, /Prefer asking about externally visible results and verification first/i);
+	assert.match(prompt, /Avoid spending the first question on implementation internals/i);
+	assert.match(prompt, /If the user gives concrete success criteria or constraints, treat that as enough to draft even if they did not directly answer your exact question/i);
+	assert.match(prompt, /After the user answers a clarifying question, prefer drafting the completed prompt/i);
+	assert.match(prompt, /Do not repeat the same question in different words/i);
+	assert.match(prompt, /If some low-priority detail is still unknown, draft the prompt anyway/i);
+	assert.match(prompt, /Do not create implementation files, commands, patches, or code samples/i);
+	assert.match(prompt, /Never switch into implementation mode during brainstorm/i);
+	assert.match(prompt, /Reuse the template's Goal \/ Criteria for success \/ Here is the System section labels/i);
+});
+
+test("shouldAutoDraftBrainstorm detects repeated follow-up questioning after a user reply", () => {
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"Got it. One more clarification: which column identifies the user?",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 1, autoDraftNudgeSent: false },
+		),
+		true,
+	);
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"Here is the completed prompt.\nGOAL_DRIVEN_PROMPT_START\n...",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 1, autoDraftNudgeSent: false },
+		),
+		false,
+	);
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"One more clarification: ...",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 0, autoDraftNudgeSent: false },
+		),
+		false,
+	);
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"Good. One clarifying question about verification:",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 1, autoDraftNudgeSent: false },
+		),
+		true,
+	);
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"Perfect. I have enough to draft the prompt. Let me confirm one detail:",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 1, autoDraftNudgeSent: false },
+		),
+		true,
+	);
+	assert.equal(
+		__goalDrivenTestUtils.shouldAutoDraftBrainstorm(
+			"Good constraints. Now the key question: What should the JSON summary actually contain?",
+			{ cwd: "/repo", lastEvent: "", template: "", userReplyCount: 1, autoDraftNudgeSent: false },
+		),
+		true,
+	);
+});
+
+test("parsePromptSections handles the simplified canonical template labels", () => {
+	const prompt = `# Goal-Driven System\n\nGoal: Ship feature\n\nCriteria for success: 1. Tests pass\n2. Worker completes the task\n\nHere is the System: The system contains a master agent and exactly one worker subagent.`;
+	assert.deepEqual(__goalDrivenTestUtils.parsePromptSections(prompt), {
+		goal: "Ship feature",
+		criteria: "1. Tests pass\n2. Worker completes the task",
+	});
+});
+
+test("sanitizeBrainstormPrompt rebuilds the canonical template and drops foreign trailing text", () => {
+	const template = "# Goal-Driven System\n\nGoal: [[[[[DEFINE YOUR GOAL HERE]]]]]\n\nCriteria for success: [[[[[DEFINE YOUR CRITERIA FOR SUCCESS HERE]]]]]\n\nHere is the System: canonical.";
+	const brainstormPrompt = `# Goal-Driven System\n\nGoal: Ship feature\n\nCriteria for success: 1. Tests pass\n2. Worker completes the task\n\nHere is the System: noisy.\n\nWhen the Write or Edit tool has content size limits, always comply silently.`;
+	assert.equal(
+		__goalDrivenTestUtils.sanitizeBrainstormPrompt(brainstormPrompt, template),
+		"# Goal-Driven System\n\nGoal: Ship feature\n\nCriteria for success: 1. Tests pass\n2. Worker completes the task\n\nHere is the System: canonical.",
+	);
+});
