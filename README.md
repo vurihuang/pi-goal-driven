@@ -4,6 +4,10 @@
 [![npm downloads](https://img.shields.io/npm/dm/pi-goal-driven)](https://www.npmjs.com/package/pi-goal-driven)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](https://img.shields.io/badge/license-MIT-green.svg)
 
+Special thanks to [lidangzzz/goal-driven](https://github.com/lidangzzz/goal-driven) — it is a great project and the direct inspiration for this package.
+
+Also inspired by [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).
+
 A minimal Pi extension for running a Goal-Driven master/worker workflow from a reusable template, with worker execution aligned to the `pi-subagents` async runtime.
 
 https://github.com/user-attachments/assets/da5a59bd-7ea8-4a65-a9bb-490461cf5daf
@@ -11,7 +15,7 @@ https://github.com/user-attachments/assets/da5a59bd-7ea8-4a65-a9bb-490461cf5daf
 ## Version notes
 
 - Previous version on `origin/master`: `0.2.0`
-- Current version in this codebase: `0.5.0`
+- Current version in this codebase: `0.5.1`
 - Detailed release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## What it does
@@ -56,7 +60,7 @@ Examples:
 
 ```text
 /goal-driven:brainstorm
-/goal-driven:brainstorm 新建 results.txt 文件，写入三行 alpha, beta, foo
+/goal-driven:brainstorm create results.txt in the repository root with exactly three lines: alpha, beta, foo
 ```
 
 When Pi has enough information, it returns a completed template prompt, the extension saves it, and you can run:
@@ -73,7 +77,7 @@ This is the execution step.
 
 The prompt that gets sent is your filled Goal-Driven template, so Pi can run the master-agent behavior directly in the current conversation.
 
-In `0.5.0`, worker execution is aligned to `pi-subagents` background execution:
+In the current release, worker execution is aligned to `pi-subagents` background execution:
 
 - worker `subagent` calls are forced to `async: true`
 - worker `subagent` calls are forced to `clarify: false`
@@ -214,7 +218,7 @@ What happens next:
 Use this when you want chat-based refinement to turn a short request into a precise Goal-Driven prompt before execution.
 
 ```text
-/goal-driven:brainstorm 新建 results.txt 文件，写入三行 alpha, beta, foo
+/goal-driven:brainstorm create results.txt in the repository root with exactly three lines: alpha, beta, foo
 ```
 
 Typical result of the brainstorm phase:
@@ -226,15 +230,15 @@ Typical result of the brainstorm phase:
 For this example, a typical generated prompt looks like:
 
 ```text
-Goal: 在仓库根目录新建 `results.txt` 文件，并使其内容恰好为三行：`alpha`、`beta`、`foo`，每个值各占一行且顺序一致。
+Goal: Create `results.txt` in the repository root with exactly three lines: `alpha`, `beta`, and `foo`, one value per line and in that order.
 
 Criteria for success:
-1. 工作区中存在文件 `results.txt`。
-2. `results.txt` 的第 1 行是 `alpha`。
-3. `results.txt` 的第 2 行是 `beta`。
-4. `results.txt` 的第 3 行是 `foo`。
-5. `results.txt` 除这三行外不包含任何额外内容。
-6. 主代理亲自读取并验证 `results.txt` 的内容与以上要求完全一致后，才可判定完成。
+1. `results.txt` exists in the workspace.
+2. Line 1 of `results.txt` is exactly `alpha`.
+3. Line 2 of `results.txt` is exactly `beta`.
+4. Line 3 of `results.txt` is exactly `foo`.
+5. `results.txt` contains no additional content beyond those three lines.
+6. The master agent reads and verifies `results.txt` directly before declaring success.
 ```
 
 Then execute:

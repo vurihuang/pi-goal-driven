@@ -2,6 +2,18 @@
 
 All notable changes to `pi-goal-driven` are documented here.
 
+## 0.5.1 - 2026-04-23
+
+### Summary
+
+Documentation-only patch release.
+
+### Changed
+
+- Restored the opening credit and direct inspiration note for [`lidangzzz/goal-driven`](https://github.com/lidangzzz/goal-driven) in `README.md`.
+- Converted the remaining Chinese README brainstorm examples into English.
+- Updated README version references for the new patch release.
+
 ## Unreleased - 2026-04-22
 
 ### Summary
