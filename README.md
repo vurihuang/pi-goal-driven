@@ -85,6 +85,9 @@ In the current release, worker execution is aligned to `pi-subagents` background
 - the master agent does **not** verify immediately after async launch
 - verification starts only after the worker completion event arrives
 - while one worker is still running in the current Goal-Driven session tree, additional worker launches are blocked
+- quiet workers are stopped by the inactivity watchdog and replaced with one new worker attempt
+- busy-stalled workers that keep repeating low-progress tool/output patterns are stopped with diagnostics preserved, then replaced with a narrower worker attempt
+- repeated busy-stall recoveries are capped so Goal-Driven escalates for attention instead of relaunching forever
 - `subagent_status list` is filtered to the current Goal-Driven session tree instead of showing global async noise from other sessions or projects
 - the lower `Async subagents` panel is expected to come from `pi-subagents`
 
@@ -165,6 +168,8 @@ Important runtime note:
 - the master only treats workers from the current Goal-Driven session tree as relevant
 - other async runs from unrelated sessions or projects are ignored for waiting, blocking, recovery, and verification decisions
 - when the master checks worker status, the session-scoped `subagent_status list` view is the source of truth
+- status output may label a run as `possible-busy-stall` when recent async evidence shows repeated low-progress activity but the auto-stop threshold has not been reached yet
+- if a busy-stalled worker is auto-stopped, Goal-Driven preserves a diagnostic session entry with the async ID, PID, cwd, elapsed time, repeated signature, and evidence sample before requesting recovery
 
 In short:
 
@@ -394,7 +399,8 @@ That leads to different strengths:
 - injecting a worker guard that forbids nested `subagent` launches inside worker sessions
 - blocking additional worker launches while one worker in the same Goal-Driven session tree is still active
 - filtering status checks to the current Goal-Driven session tree instead of the global async run pool
-- using an inactivity watchdog to stop and replace stale workers
+- using watchdogs to stop and replace stale workers, including quiet inactivity and repetitive busy-stall loops
+- capping consecutive busy-stall replacements so repeated failures escalate for human/master attention instead of relaunching indefinitely
 
 `ralph` currently includes repo-loop behavior such as:
 
