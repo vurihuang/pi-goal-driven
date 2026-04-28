@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { __goalDrivenTestUtils } from "./index.ts";
@@ -194,6 +194,111 @@ test("classifyBusyStall distinguishes busy, possible, and healthy runs", () => {
 		} as never).classification,
 		"healthy",
 	);
+});
+
+test("inactive heartbeat probe classifies pending, resumed, stale, and expired workers", () => {
+	const now = 10_000_000;
+	const staleHeartbeat = now - __goalDrivenTestUtils.WATCHDOG_INACTIVE_PROBE_AFTER_MS - 1;
+	const snapshot = {
+		state: "running",
+		lastUpdate: staleHeartbeat,
+		pid: 1234,
+		outputFile: null,
+	} as const;
+
+	const pending = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: null,
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(pending.classification, "probe-pending");
+	assert.equal(pending.probe?.asyncId, "run-a");
+
+	const resumed = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: now - 1_000,
+		previousProbe: pending.probe ?? null,
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(resumed.classification, "active");
+
+	const stale = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: null,
+		now,
+		pidAlive: () => false,
+	});
+	assert.equal(stale.classification, "stale-running");
+	assert.match(stale.reason, /PID 1234/);
+
+	const expired = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: { ...pending.probe!, graceUntil: now - 1 },
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(expired.classification, "inactive-expired");
+});
+
+test("watchdog end-to-end recovers a stale running async worker with dead PID", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "goal-driven-stale-worker-"));
+	const asyncDir = path.join(root, "run-a");
+	await mkdir(asyncDir);
+	const now = Date.now();
+	await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+		state: "running",
+		pid: 9_999_999,
+		lastUpdate: now - __goalDrivenTestUtils.WATCHDOG_INACTIVE_PROBE_AFTER_MS - 1_000,
+		steps: [{ agent: "worker", status: "running", startedAt: now - 10_000 }],
+	}), "utf8");
+
+	const sentMessages: string[] = [];
+	const run = {
+		cwd: "/repo",
+		sessionId: "session-a",
+		sessionFile: "/tmp/session-a.jsonl",
+		goal: "Ship feature",
+		criteria: "Tests pass",
+		attempt: 1,
+		phase: "working",
+		awaitingVerification: false,
+		verificationReminders: 0,
+		verificationReminderSent: false,
+		activeAsyncId: "run-a",
+		activeAsyncDir: asyncDir,
+		latestAsyncId: "run-a",
+		latestAsyncDir: asyncDir,
+		knownAsyncRuns: [{ id: "run-a", dir: asyncDir }],
+		busyStallRecoveries: 0,
+		inactiveProbe: null,
+		lastEvent: "running",
+	};
+	const pi = {
+		sendMessage(message: { content?: string }) {
+			sentMessages.push(message.content ?? "");
+		},
+	} as never;
+
+	const result = await __goalDrivenTestUtils.runWatchdogTickForTest(run as never, pi);
+	const status = JSON.parse(await readFile(path.join(asyncDir, "status.json"), "utf8")) as { state?: string; error?: string; steps?: Array<{ status?: string }> };
+
+	assert.equal(status.state, "failed");
+	assert.equal(status.error, "Stopped by Goal-Driven stale-running watchdog");
+	assert.equal(status.steps?.[0]?.status, "failed");
+	assert.equal(result?.activeAsyncId, null);
+	assert.match(result?.lastEvent ?? "", /PID 9999999 is no longer alive; replacement requested/);
+	assert.equal(sentMessages.length, 1);
+	assert.match(sentMessages[0], /Launch exactly one replacement worker subagent/);
+	assert.match(sentMessages[0], /avoid repeating any silent long-running command without a timeout/);
 });
 
 test("busy-stall follow-up prompts separate replacement from escalation", () => {

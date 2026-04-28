@@ -40,8 +40,12 @@ const GOAL_DRIVEN_ASYNC_RUNS_DIR = path.join(
 	"async-subagent-runs",
 );
 const WATCHDOG_POLL_MS = 15_000;
+const WATCHDOG_INACTIVE_PROBE_AFTER_MS = 5 * 60 * 1000;
+const WATCHDOG_INACTIVE_GRACE_MS = 2 * 60 * 1000;
 const WATCHDOG_INACTIVE_TIMEOUT_MS = 15 * 60 * 1000;
 const WATCHDOG_STOP_REASON = "Stopped by Goal-Driven inactivity watchdog";
+const WATCHDOG_STALE_RUNNING_STOP_REASON = "Stopped by Goal-Driven stale-running watchdog";
+const WATCHDOG_INACTIVE_PROBE_STOP_REASON = "Stopped by Goal-Driven inactive heartbeat probe";
 const WATCHDOG_BUSY_STALL_WARNING_MIN_AGE_MS = 10 * 60 * 1000;
 const WATCHDOG_BUSY_STALL_STOP_MIN_AGE_MS = 30 * 60 * 1000;
 const WATCHDOG_BUSY_STALL_WARNING_REPEAT_COUNT = 12;
@@ -66,6 +70,8 @@ type RunPhase = "working" | "verifying";
 type AsyncRunState = "queued" | "running" | "complete" | "failed";
 type AsyncRunStopOutcome = "stopped" | "already-finished" | "missing" | "error";
 type BusyStallClassification = "healthy" | "possible-busy-stall" | "busy-stall";
+type InactiveProbeStatus = "probe-pending" | "stale-running";
+type InactiveProbeClassification = "active" | "probe-pending" | "stale-running" | "inactive-expired" | "unknown";
 
 interface ActiveBrainstorm {
 	cwd: string;
@@ -148,6 +154,22 @@ interface BusyStallDiagnostic {
 	evidence: string[];
 }
 
+interface InactiveProbeState {
+	asyncId: string;
+	firstInactiveAt: number;
+	lastHeartbeatAt: number;
+	graceUntil: number;
+	pid: number | null;
+	status: InactiveProbeStatus;
+}
+
+interface InactiveProbeResult {
+	classification: InactiveProbeClassification;
+	reason: string;
+	probe?: InactiveProbeState;
+	inactiveForMs?: number;
+}
+
 interface GoalDrivenBusyStallEntry {
 	sessionId: string;
 	sessionFile: string | null;
@@ -185,6 +207,7 @@ interface ActiveRun {
 	latestAsyncDir: string | null;
 	knownAsyncRuns: KnownAsyncRun[];
 	busyStallRecoveries: number;
+	inactiveProbe: InactiveProbeState | null;
 	lastEvent: string;
 }
 
@@ -698,6 +721,95 @@ async function getAsyncRunHeartbeatAt(asyncDir: string): Promise<number | null> 
 	return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
+function isPidAlive(pid: number | null): boolean {
+	if (pid === null) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function probeInactiveAsyncRun(input: {
+	asyncId: string;
+	snapshot: AsyncRunSnapshot;
+	heartbeatAt: number | null;
+	previousProbe: InactiveProbeState | null;
+	now: number;
+	pidAlive: (pid: number | null) => boolean;
+	probeAfterMs?: number;
+	graceMs?: number;
+}): InactiveProbeResult {
+	const probeAfterMs = input.probeAfterMs ?? WATCHDOG_INACTIVE_PROBE_AFTER_MS;
+	const graceMs = input.graceMs ?? WATCHDOG_INACTIVE_GRACE_MS;
+	if (input.snapshot.state !== "queued" && input.snapshot.state !== "running") {
+		return { classification: "active", reason: "async run is not active" };
+	}
+	if (input.heartbeatAt === null) {
+		return { classification: "unknown", reason: "no heartbeat evidence available" };
+	}
+
+	const inactiveForMs = Math.max(0, input.now - input.heartbeatAt);
+	if (inactiveForMs < probeAfterMs) {
+		return { classification: "active", reason: `heartbeat observed ${formatInactivity(inactiveForMs)} ago`, inactiveForMs };
+	}
+
+	if (input.snapshot.state === "running" && !input.pidAlive(input.snapshot.pid)) {
+		return {
+			classification: "stale-running",
+			reason: input.snapshot.pid === null
+				? "async status is running but has no recorded PID"
+				: `async status is running but PID ${input.snapshot.pid} is no longer alive`,
+			probe: {
+				asyncId: input.asyncId,
+				firstInactiveAt: input.now,
+				lastHeartbeatAt: input.heartbeatAt,
+				graceUntil: input.now,
+				pid: input.snapshot.pid,
+				status: "stale-running",
+			},
+			inactiveForMs,
+		};
+	}
+
+	const previous = input.previousProbe?.asyncId === input.asyncId && input.previousProbe.lastHeartbeatAt === input.heartbeatAt
+		? input.previousProbe
+		: null;
+	const probe = previous ?? {
+		asyncId: input.asyncId,
+		firstInactiveAt: input.now,
+		lastHeartbeatAt: input.heartbeatAt,
+		graceUntil: input.now + graceMs,
+		pid: input.snapshot.pid,
+		status: "probe-pending" as const,
+	};
+	if (input.now < probe.graceUntil) {
+		return {
+			classification: "probe-pending",
+			reason: `worker inactive for ${formatInactivity(inactiveForMs)}; heartbeat probe grace pending`,
+			probe,
+			inactiveForMs,
+		};
+	}
+
+	return {
+		classification: "inactive-expired",
+		reason: `worker remained inactive for ${formatInactivity(inactiveForMs)} after heartbeat probe grace`,
+		probe,
+		inactiveForMs,
+	};
+}
+
+function buildInactiveProbeReplacementInstruction(result: InactiveProbeResult): string {
+	return [
+		"The previous worker stopped producing heartbeat updates and was stopped by the Goal-Driven watchdog.",
+		`Probe result: ${result.reason}.`,
+		"Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
+		"The replacement worker should inspect the previous async status/output evidence first and avoid repeating any silent long-running command without a timeout or visible progress output.",
+	].join("\n\n");
+}
+
 async function readTailText(filePath: string | null, maxBytes = ASYNC_TAIL_BYTES): Promise<string> {
 	if (!filePath) return "";
 	try {
@@ -956,10 +1068,49 @@ async function watchdogTick(pi: ExtensionAPI): Promise<void> {
 	if (!snapshot || (snapshot.state !== "queued" && snapshot.state !== "running")) return;
 
 	const heartbeatAt = await getAsyncRunHeartbeatAt(runningKnownRun.dir);
-	if (heartbeatAt === null) return;
+	const now = Date.now();
+	const inactiveProbe = probeInactiveAsyncRun({
+		asyncId: runningKnownRun.id,
+		snapshot,
+		heartbeatAt,
+		previousProbe: run.inactiveProbe,
+		now,
+		pidAlive: isPidAlive,
+	});
+	if (inactiveProbe.classification === "active") {
+		run.inactiveProbe = null;
+	} else if (inactiveProbe.classification === "probe-pending" && inactiveProbe.probe) {
+		run.inactiveProbe = inactiveProbe.probe;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] ${inactiveProbe.reason}; grace until ${new Date(inactiveProbe.probe.graceUntil).toLocaleTimeString()}`;
+		refreshStatus();
+		return;
+	} else if (inactiveProbe.classification === "stale-running" || inactiveProbe.classification === "inactive-expired") {
+		run.inactiveProbe = inactiveProbe.probe ?? null;
+		const stoppedWorkers = await stopKnownAsyncRuns(
+			run,
+			inactiveProbe.classification === "stale-running" ? WATCHDOG_STALE_RUNNING_STOP_REASON : WATCHDOG_INACTIVE_PROBE_STOP_REASON,
+		);
+		if (stoppedWorkers <= 0) return;
 
-	const inactiveForMs = Date.now() - heartbeatAt;
-	if (inactiveForMs >= WATCHDOG_INACTIVE_TIMEOUT_MS) {
+		run.phase = "working";
+		run.awaitingVerification = false;
+		run.verificationReminderSent = false;
+		run.activeAsyncId = null;
+		run.activeAsyncDir = null;
+		run.latestAsyncId = runningKnownRun.id;
+		run.latestAsyncDir = runningKnownRun.dir;
+		run.inactiveProbe = null;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] ${inactiveProbe.reason}; replacement requested`;
+		refreshStatus();
+		if (latestCtx?.hasUI) {
+			latestCtx.ui.notify(
+				`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} ${inactiveProbe.reason}. Stopped it and requested a replacement worker.`,
+				"warning",
+			);
+		}
+		sendGoalDrivenFollowUp(pi, buildInactiveProbeReplacementInstruction(inactiveProbe));
+		return;
+	} else if (heartbeatAt !== null && now - heartbeatAt >= WATCHDOG_INACTIVE_TIMEOUT_MS) {
 		const stoppedWorkers = await stopKnownAsyncRuns(run, WATCHDOG_STOP_REASON);
 		if (stoppedWorkers <= 0) return;
 
@@ -970,11 +1121,12 @@ async function watchdogTick(pi: ExtensionAPI): Promise<void> {
 		run.activeAsyncDir = null;
 		run.latestAsyncId = runningKnownRun.id;
 		run.latestAsyncDir = runningKnownRun.dir;
-		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] inactive for ${formatInactivity(inactiveForMs)}; replacement requested`;
+		run.inactiveProbe = null;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] inactive for ${formatInactivity(now - heartbeatAt)}; replacement requested`;
 		refreshStatus();
 		if (latestCtx?.hasUI) {
 			latestCtx.ui.notify(
-				`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was inactive for ${formatInactivity(inactiveForMs)}. Stopped it and requested a replacement worker.`,
+				`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was inactive for ${formatInactivity(now - heartbeatAt)}. Stopped it and requested a replacement worker.`,
 				"warning",
 			);
 		}
@@ -1617,6 +1769,7 @@ async function runSavedPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 		latestAsyncDir: null,
 		knownAsyncRuns: [],
 		busyStallRecoveries: 0,
+		inactiveProbe: null,
 		lastEvent: "Launching master/subagent run",
 	};
 	await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
@@ -1702,6 +1855,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.verificationReminderSent = false;
 			activeRun.activeAsyncId = runningKnownRun.id;
 			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
 			refreshStatus();
 			return { block: true, reason: `Goal-Driven worker ${runningKnownRun.id} is still running in background.` };
@@ -1714,6 +1868,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.phase = "working";
 		activeRun.awaitingVerification = false;
 		activeRun.verificationReminderSent = false;
+		activeRun.inactiveProbe = null;
 		activeRun.lastEvent = `Worker subagent attempt #${activeRun.attempt} launching in background`;
 		refreshStatus();
 	});
@@ -1743,6 +1898,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.verificationReminderSent = false;
 			activeRun.activeAsyncId = null;
 			activeRun.activeAsyncDir = null;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} failed to launch in async mode`;
 			refreshStatus();
 			sendGoalDrivenFollowUp(
@@ -1764,6 +1920,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.verificationReminderSent = false;
 		activeRun.activeAsyncId = launch.asyncId;
 		activeRun.activeAsyncDir = launch.asyncDir;
+		activeRun.inactiveProbe = null;
 		activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} running in background [${launch.asyncId.slice(0, 6)}]`;
 		refreshStatus();
 		ensureWatchdog(pi);
@@ -1782,6 +1939,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.verificationReminders = 0;
 		activeRun.verificationReminderSent = false;
 		activeRun.busyStallRecoveries = 0;
+		activeRun.inactiveProbe = null;
 		activeRun.activeAsyncId = null;
 		activeRun.activeAsyncDir = result.asyncDir ?? activeRun.latestAsyncDir ?? activeRun.activeAsyncDir;
 		activeRun.latestAsyncId = result.id;
@@ -1894,6 +2052,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.phase = "working";
 			activeRun.activeAsyncId = runningKnownRun.id;
 			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
 			refreshStatus();
 			return;
@@ -1903,6 +2062,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.awaitingVerification = false;
 			activeRun.verificationReminderSent = false;
 			activeRun.phase = "working";
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Master requested another worker attempt after verification`;
 			refreshStatus();
 			return;
@@ -1983,14 +2143,29 @@ export default function goalDriven(pi: ExtensionAPI): void {
 	});
 }
 
+async function runWatchdogTickForTest(run: ActiveRun, pi: ExtensionAPI, sessionManager?: SessionManagerView | null): Promise<ActiveRun | null> {
+	activeRun = run;
+	latestCtx = { sessionManager, hasUI: false } as ExtensionContext;
+	await watchdogTick(pi);
+	const result = activeRun;
+	latestCtx = null;
+	activeRun = null;
+	return result;
+}
+
 export const __goalDrivenTestUtils = {
 	GOAL_DRIVEN_WORKER_TASK_GUARD,
+	WATCHDOG_INACTIVE_PROBE_AFTER_MS,
+	WATCHDOG_INACTIVE_GRACE_MS,
 	prependWorkerTaskGuard,
 	collectPersistedKnownAsyncRuns,
 	matchesSessionRef,
 	getSessionTreeRoot,
 	formatAsyncRunCleanupSummary,
 	formatScopedSubagentStatusList,
+	probeInactiveAsyncRun,
+	buildInactiveProbeReplacementInstruction,
+	runWatchdogTickForTest,
 	inspectAsyncRunForBusyStall,
 	classifyBusyStall,
 	buildBusyStallReplacementInstruction,
