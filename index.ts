@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ const PLACEHOLDER_TOKEN = "[[[[[";
 const MASTER_MET_VERDICT = "GOAL_DRIVEN_VERDICT: MET";
 const GOAL_DRIVEN_WORKER_AGENT = "worker";
 const GOAL_DRIVEN_ASYNC_RUN_ENTRY = `${EXTENSION_NAME}:async-run`;
+const GOAL_DRIVEN_BUSY_STALL_ENTRY = `${EXTENSION_NAME}:busy-stall`;
 const GOAL_DRIVEN_WORKER_TASK_GUARD = [
 	"Goal-Driven worker execution rules:",
 	"- Do the implementation work directly in this worker session.",
@@ -39,8 +40,19 @@ const GOAL_DRIVEN_ASYNC_RUNS_DIR = path.join(
 	"async-subagent-runs",
 );
 const WATCHDOG_POLL_MS = 15_000;
+const WATCHDOG_INACTIVE_PROBE_AFTER_MS = 5 * 60 * 1000;
+const WATCHDOG_INACTIVE_GRACE_MS = 2 * 60 * 1000;
 const WATCHDOG_INACTIVE_TIMEOUT_MS = 15 * 60 * 1000;
 const WATCHDOG_STOP_REASON = "Stopped by Goal-Driven inactivity watchdog";
+const WATCHDOG_STALE_RUNNING_STOP_REASON = "Stopped by Goal-Driven stale-running watchdog";
+const WATCHDOG_INACTIVE_PROBE_STOP_REASON = "Stopped by Goal-Driven inactive heartbeat probe";
+const WATCHDOG_BUSY_STALL_WARNING_MIN_AGE_MS = 10 * 60 * 1000;
+const WATCHDOG_BUSY_STALL_STOP_MIN_AGE_MS = 30 * 60 * 1000;
+const WATCHDOG_BUSY_STALL_WARNING_REPEAT_COUNT = 12;
+const WATCHDOG_BUSY_STALL_STOP_REPEAT_COUNT = 30;
+const WATCHDOG_BUSY_STALL_MAX_RECOVERIES = 2;
+const WATCHDOG_BUSY_STALL_STOP_REASON = "Stopped by Goal-Driven busy-stall watchdog";
+const ASYNC_TAIL_BYTES = 64 * 1024;
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_PATH = path.join(PACKAGE_DIR, "goal-driven-template.md");
@@ -57,6 +69,9 @@ const USAGE_TEXT = [
 type RunPhase = "working" | "verifying";
 type AsyncRunState = "queued" | "running" | "complete" | "failed";
 type AsyncRunStopOutcome = "stopped" | "already-finished" | "missing" | "error";
+type BusyStallClassification = "healthy" | "possible-busy-stall" | "busy-stall";
+type InactiveProbeStatus = "probe-pending" | "stale-running";
+type InactiveProbeClassification = "active" | "probe-pending" | "stale-running" | "inactive-expired" | "unknown";
 
 interface ActiveBrainstorm {
 	cwd: string;
@@ -110,10 +125,67 @@ interface ScopedAsyncRunStatus {
 	totalSteps: number;
 	cwd: string | null;
 	startedAt: number | null;
+	busyStall?: BusyStallClassification;
+	busyStallReason?: string;
 	steps: Array<{
 		agent: string;
 		status: string;
 	}>;
+}
+
+interface AsyncRunBusyStallInspection {
+	id: string;
+	asyncDir: string;
+	state: AsyncRunState | null;
+	pid: number | null;
+	cwd: string | null;
+	startedAt: number | null;
+	elapsedMs: number | null;
+	recentToolSignatures: string[];
+	recentOutputLines: string[];
+	evidence: string[];
+}
+
+interface BusyStallDiagnostic {
+	classification: BusyStallClassification;
+	reason: string;
+	repeatedSignature: string | null;
+	repeatCount: number;
+	evidence: string[];
+}
+
+interface InactiveProbeState {
+	asyncId: string;
+	firstInactiveAt: number;
+	lastHeartbeatAt: number;
+	graceUntil: number;
+	pid: number | null;
+	status: InactiveProbeStatus;
+}
+
+interface InactiveProbeResult {
+	classification: InactiveProbeClassification;
+	reason: string;
+	probe?: InactiveProbeState;
+	inactiveForMs?: number;
+}
+
+interface GoalDrivenBusyStallEntry {
+	sessionId: string;
+	sessionFile: string | null;
+	asyncId: string;
+	asyncDir: string;
+	pid: number | null;
+	cwd: string | null;
+	elapsedMs: number | null;
+	classification: BusyStallClassification;
+	reason: string;
+	repeatedSignature: string | null;
+	repeatCount: number;
+	evidence: string[];
+	stoppedAt: number;
+	recoveryCount: number;
+	replacementRequested: boolean;
 }
 
 type SessionManagerView = ExtensionContext["sessionManager"];
@@ -134,6 +206,8 @@ interface ActiveRun {
 	latestAsyncId: string | null;
 	latestAsyncDir: string | null;
 	knownAsyncRuns: KnownAsyncRun[];
+	busyStallRecoveries: number;
+	inactiveProbe: InactiveProbeState | null;
 	lastEvent: string;
 }
 
@@ -567,6 +641,14 @@ async function listSessionScopedActiveAsyncRuns(
 		const status = await readScopedAsyncRunStatus(asyncId, asyncRunsDir);
 		if (!status) continue;
 		if (status.state !== "queued" && status.state !== "running") continue;
+		const inspection = await inspectAsyncRunForBusyStall(asyncId, path.join(asyncRunsDir, asyncId));
+		if (inspection) {
+			const diagnostic = classifyBusyStall(inspection);
+			if (diagnostic.classification !== "healthy") {
+				status.busyStall = diagnostic.classification;
+				status.busyStallReason = diagnostic.reason;
+			}
+		}
 		runs.push(status);
 	}
 	return runs.sort((left, right) => (right.startedAt ?? 0) - (left.startedAt ?? 0));
@@ -578,8 +660,11 @@ function formatScopedSubagentStatusList(runs: ScopedAsyncRunStatus[]): string {
 	for (const run of runs) {
 		const stepNumber = run.currentStep === null ? "?" : String(Math.min(run.currentStep + 1, Math.max(run.totalSteps, 1)));
 		const totalSteps = run.totalSteps > 0 ? String(run.totalSteps) : "?";
+		const busyStall = run.busyStall && run.busyStall !== "healthy"
+			? ` | ${run.busyStall}: ${run.busyStallReason ?? "repeated low-progress activity"}`
+			: "";
 		lines.push(
-			`- ${run.id} | ${run.state} | ${run.mode ?? "single"} | step ${stepNumber}/${totalSteps} | ${shortenHomePath(run.cwd)}`,
+			`- ${run.id} | ${run.state} | ${run.mode ?? "single"} | step ${stepNumber}/${totalSteps} | ${shortenHomePath(run.cwd)}${busyStall}`,
 		);
 		for (const [index, step] of run.steps.entries()) {
 			lines.push(`  ${index + 1}. ${step.agent} | ${step.status}`);
@@ -636,6 +721,253 @@ async function getAsyncRunHeartbeatAt(asyncDir: string): Promise<number | null> 
 	return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
+function isPidAlive(pid: number | null): boolean {
+	if (pid === null) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function probeInactiveAsyncRun(input: {
+	asyncId: string;
+	snapshot: AsyncRunSnapshot;
+	heartbeatAt: number | null;
+	previousProbe: InactiveProbeState | null;
+	now: number;
+	pidAlive: (pid: number | null) => boolean;
+	probeAfterMs?: number;
+	graceMs?: number;
+}): InactiveProbeResult {
+	const probeAfterMs = input.probeAfterMs ?? WATCHDOG_INACTIVE_PROBE_AFTER_MS;
+	const graceMs = input.graceMs ?? WATCHDOG_INACTIVE_GRACE_MS;
+	if (input.snapshot.state !== "queued" && input.snapshot.state !== "running") {
+		return { classification: "active", reason: "async run is not active" };
+	}
+	if (input.heartbeatAt === null) {
+		return { classification: "unknown", reason: "no heartbeat evidence available" };
+	}
+
+	const inactiveForMs = Math.max(0, input.now - input.heartbeatAt);
+	if (inactiveForMs < probeAfterMs) {
+		return { classification: "active", reason: `heartbeat observed ${formatInactivity(inactiveForMs)} ago`, inactiveForMs };
+	}
+
+	if (input.snapshot.state === "running" && !input.pidAlive(input.snapshot.pid)) {
+		return {
+			classification: "stale-running",
+			reason: input.snapshot.pid === null
+				? "async status is running but has no recorded PID"
+				: `async status is running but PID ${input.snapshot.pid} is no longer alive`,
+			probe: {
+				asyncId: input.asyncId,
+				firstInactiveAt: input.now,
+				lastHeartbeatAt: input.heartbeatAt,
+				graceUntil: input.now,
+				pid: input.snapshot.pid,
+				status: "stale-running",
+			},
+			inactiveForMs,
+		};
+	}
+
+	const previous = input.previousProbe?.asyncId === input.asyncId && input.previousProbe.lastHeartbeatAt === input.heartbeatAt
+		? input.previousProbe
+		: null;
+	const probe = previous ?? {
+		asyncId: input.asyncId,
+		firstInactiveAt: input.now,
+		lastHeartbeatAt: input.heartbeatAt,
+		graceUntil: input.now + graceMs,
+		pid: input.snapshot.pid,
+		status: "probe-pending" as const,
+	};
+	if (input.now < probe.graceUntil) {
+		return {
+			classification: "probe-pending",
+			reason: `worker inactive for ${formatInactivity(inactiveForMs)}; heartbeat probe grace pending`,
+			probe,
+			inactiveForMs,
+		};
+	}
+
+	return {
+		classification: "inactive-expired",
+		reason: `worker remained inactive for ${formatInactivity(inactiveForMs)} after heartbeat probe grace`,
+		probe,
+		inactiveForMs,
+	};
+}
+
+function buildInactiveProbeReplacementInstruction(result: InactiveProbeResult): string {
+	return [
+		"The previous worker stopped producing heartbeat updates and was stopped by the Goal-Driven watchdog.",
+		`Probe result: ${result.reason}.`,
+		"Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
+		"The replacement worker should inspect the previous async status/output evidence first and avoid repeating any silent long-running command without a timeout or visible progress output.",
+	].join("\n\n");
+}
+
+async function readTailText(filePath: string | null, maxBytes = ASYNC_TAIL_BYTES): Promise<string> {
+	if (!filePath) return "";
+	try {
+		const fileStat = await stat(filePath);
+		if (fileStat.size <= maxBytes) return readFile(filePath, "utf8");
+		const handle = await open(filePath, "r");
+		try {
+			const buffer = Buffer.alloc(maxBytes);
+			await handle.read(buffer, 0, maxBytes, Math.max(0, fileStat.size - maxBytes));
+			return buffer.toString("utf8");
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return "";
+	}
+}
+
+function normalizeForSignature(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(normalizeForSignature);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([key, entry]) => [key, normalizeForSignature(entry)]),
+	);
+}
+
+function eventToolSignature(event: unknown): string | null {
+	if (!event || typeof event !== "object") return null;
+	const candidate = event as { type?: unknown; toolName?: unknown; args?: unknown };
+	if (candidate.type !== "tool_execution_start" || typeof candidate.toolName !== "string") return null;
+	const args = candidate.args === undefined ? "" : ` ${JSON.stringify(normalizeForSignature(candidate.args))}`;
+	return `${candidate.toolName}${args}`;
+}
+
+function eventOutputLine(event: unknown): string | null {
+	if (!event || typeof event !== "object") return null;
+	const candidate = event as { type?: unknown; line?: unknown };
+	if (candidate.type !== "subagent.child.stdout" && candidate.type !== "subagent.child.stderr") return null;
+	return typeof candidate.line === "string" ? candidate.line.trim() : null;
+}
+
+function resolveAsyncOutputFile(asyncDir: string, outputFile: unknown): string | null {
+	if (typeof outputFile !== "string" || !outputFile) return null;
+	return path.isAbsolute(outputFile) ? outputFile : path.join(asyncDir, outputFile);
+}
+
+async function inspectAsyncRunForBusyStall(
+	asyncId: string,
+	asyncDir: string,
+	now = Date.now(),
+): Promise<AsyncRunBusyStallInspection | null> {
+	try {
+		const raw = await readFile(path.join(asyncDir, "status.json"), "utf8");
+		const status = JSON.parse(raw) as {
+			state?: string;
+			pid?: number;
+			cwd?: string;
+			startedAt?: number;
+			outputFile?: string;
+		};
+		const state = status.state === "queued"
+			|| status.state === "running"
+			|| status.state === "complete"
+			|| status.state === "failed"
+			? status.state
+			: null;
+		const startedAt = typeof status.startedAt === "number" ? status.startedAt : null;
+		const outputFile = resolveAsyncOutputFile(asyncDir, status.outputFile);
+		const toolSignatures: string[] = [];
+		const outputLines: string[] = [];
+
+		const eventsText = await readTailText(path.join(asyncDir, "events.jsonl"));
+		for (const line of eventsText.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const event = JSON.parse(line) as unknown;
+				const toolSignature = eventToolSignature(event);
+				if (toolSignature) toolSignatures.push(toolSignature);
+				const outputLine = eventOutputLine(event);
+				if (outputLine) outputLines.push(outputLine);
+			} catch {
+				continue;
+			}
+		}
+
+		const outputText = await readTailText(outputFile);
+		for (const line of outputText.split("\n")) {
+			const trimmed = line.trim();
+			if (trimmed) outputLines.push(trimmed);
+		}
+
+		const recentToolSignatures = toolSignatures.slice(-200);
+		const recentOutputLines = outputLines.slice(-200);
+		return {
+			id: asyncId,
+			asyncDir,
+			state,
+			pid: typeof status.pid === "number" ? status.pid : null,
+			cwd: typeof status.cwd === "string" ? status.cwd : null,
+			startedAt,
+			elapsedMs: startedAt === null ? null : Math.max(0, now - startedAt),
+			recentToolSignatures,
+			recentOutputLines,
+			evidence: [...recentToolSignatures.map((signature) => `tool: ${signature}`), ...recentOutputLines.map((line) => `output: ${line}`)].slice(-12),
+		};
+	} catch {
+		return null;
+	}
+}
+
+function isLowInformationOutputLine(line: string): boolean {
+	return /^exit:\s*\d+$/i.test(line) || line.startsWith("bash:");
+}
+
+function mostRepeated(values: string[]): { value: string | null; count: number } {
+	const counts = new Map<string, number>();
+	for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+	let repeated = { value: null as string | null, count: 0 };
+	for (const [value, count] of counts.entries()) {
+		if (count > repeated.count) repeated = { value, count };
+	}
+	return repeated;
+}
+
+function classifyBusyStall(inspection: AsyncRunBusyStallInspection): BusyStallDiagnostic {
+	if (inspection.state !== "queued" && inspection.state !== "running") {
+		return { classification: "healthy", reason: "async run is not active", repeatedSignature: null, repeatCount: 0, evidence: [] };
+	}
+	const elapsedMs = inspection.elapsedMs ?? 0;
+	const signatures = [
+		...inspection.recentToolSignatures.map((signature) => `tool: ${signature}`),
+		...inspection.recentOutputLines.filter(isLowInformationOutputLine).map((line) => `output: ${line}`),
+	];
+	const repeated = mostRepeated(signatures);
+	const evidence = inspection.evidence.filter((entry) => !repeated.value || entry === repeated.value).slice(-6);
+	if (elapsedMs >= WATCHDOG_BUSY_STALL_STOP_MIN_AGE_MS && repeated.count >= WATCHDOG_BUSY_STALL_STOP_REPEAT_COUNT) {
+		return {
+			classification: "busy-stall",
+			reason: `repeated ${repeated.count} low-progress events over ${formatInactivity(elapsedMs)}`,
+			repeatedSignature: repeated.value,
+			repeatCount: repeated.count,
+			evidence,
+		};
+	}
+	if (elapsedMs >= WATCHDOG_BUSY_STALL_WARNING_MIN_AGE_MS && repeated.count >= WATCHDOG_BUSY_STALL_WARNING_REPEAT_COUNT) {
+		return {
+			classification: "possible-busy-stall",
+			reason: `repeated ${repeated.count} low-progress events over ${formatInactivity(elapsedMs)}`,
+			repeatedSignature: repeated.value,
+			repeatCount: repeated.count,
+			evidence,
+		};
+	}
+	return { classification: "healthy", reason: "no repeated low-progress pattern detected", repeatedSignature: repeated.value, repeatCount: repeated.count, evidence };
+}
+
 function formatInactivity(durationMs: number): string {
 	if (durationMs < 60_000) return `${Math.max(1, Math.floor(durationMs / 1000))}s`;
 	return `${Math.max(1, Math.floor(durationMs / 60_000))}m`;
@@ -653,6 +985,63 @@ function ensureWatchdog(pi: ExtensionAPI): void {
 		void watchdogTick(pi);
 	}, WATCHDOG_POLL_MS);
 	watchdogTimer.unref?.();
+}
+
+function buildBusyStallEntry(input: {
+	run: ActiveRun;
+	knownRun: KnownAsyncRun;
+	inspection: AsyncRunBusyStallInspection;
+	diagnostic: BusyStallDiagnostic;
+	stoppedAt: number;
+	recoveryCount: number;
+	replacementRequested: boolean;
+}): GoalDrivenBusyStallEntry {
+	return {
+		sessionId: input.run.sessionId,
+		sessionFile: input.run.sessionFile,
+		asyncId: input.knownRun.id,
+		asyncDir: input.knownRun.dir ?? input.inspection.asyncDir,
+		pid: input.inspection.pid,
+		cwd: input.inspection.cwd,
+		elapsedMs: input.inspection.elapsedMs,
+		classification: input.diagnostic.classification,
+		reason: input.diagnostic.reason,
+		repeatedSignature: input.diagnostic.repeatedSignature,
+		repeatCount: input.diagnostic.repeatCount,
+		evidence: input.diagnostic.evidence,
+		stoppedAt: input.stoppedAt,
+		recoveryCount: input.recoveryCount,
+		replacementRequested: input.replacementRequested,
+	};
+}
+
+function formatBusyStallEvidence(diagnostic: BusyStallDiagnostic): string {
+	const evidence = diagnostic.evidence.length > 0
+		? diagnostic.evidence.map((entry) => `- ${entry}`).join("\n")
+		: "- No recent event sample was available.";
+	return [
+		`Reason: ${diagnostic.reason}`,
+		diagnostic.repeatedSignature ? `Repeated signature: ${diagnostic.repeatedSignature}` : undefined,
+		`Evidence:\n${evidence}`,
+	].filter((line): line is string => Boolean(line)).join("\n");
+}
+
+function buildBusyStallReplacementInstruction(diagnostic: BusyStallDiagnostic, recoveryCount: number): string {
+	return [
+		"The previous worker was stopped by the Goal-Driven busy-stall watchdog because it was active but repeating low-progress work.",
+		formatBusyStallEvidence(diagnostic),
+		`Busy-stall recovery attempt ${recoveryCount} of ${WATCHDOG_BUSY_STALL_MAX_RECOVERIES}.`,
+		"Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
+		"The replacement worker must not repeat the same exploration loop. It should inspect the preserved evidence, choose the smallest concrete fix or verification path, and return a final report or patch for the master to verify.",
+	].join("\n\n");
+}
+
+function buildBusyStallEscalationInstruction(diagnostic: BusyStallDiagnostic): string {
+	return [
+		"A Goal-Driven worker was stopped after repeated busy-stall recoveries. Do not launch another replacement worker automatically.",
+		formatBusyStallEvidence(diagnostic),
+		"Inspect the preserved async run evidence and decide whether to narrow the goal, ask the user for direction, or verify the workspace manually.",
+	].join("\n\n");
 }
 
 async function watchdogTick(pi: ExtensionAPI): Promise<void> {
@@ -679,14 +1068,86 @@ async function watchdogTick(pi: ExtensionAPI): Promise<void> {
 	if (!snapshot || (snapshot.state !== "queued" && snapshot.state !== "running")) return;
 
 	const heartbeatAt = await getAsyncRunHeartbeatAt(runningKnownRun.dir);
-	if (heartbeatAt === null) return;
+	const now = Date.now();
+	const inactiveProbe = probeInactiveAsyncRun({
+		asyncId: runningKnownRun.id,
+		snapshot,
+		heartbeatAt,
+		previousProbe: run.inactiveProbe,
+		now,
+		pidAlive: isPidAlive,
+	});
+	if (inactiveProbe.classification === "active") {
+		run.inactiveProbe = null;
+	} else if (inactiveProbe.classification === "probe-pending" && inactiveProbe.probe) {
+		run.inactiveProbe = inactiveProbe.probe;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] ${inactiveProbe.reason}; grace until ${new Date(inactiveProbe.probe.graceUntil).toLocaleTimeString()}`;
+		refreshStatus();
+		return;
+	} else if (inactiveProbe.classification === "stale-running" || inactiveProbe.classification === "inactive-expired") {
+		run.inactiveProbe = inactiveProbe.probe ?? null;
+		const stoppedWorkers = await stopKnownAsyncRuns(
+			run,
+			inactiveProbe.classification === "stale-running" ? WATCHDOG_STALE_RUNNING_STOP_REASON : WATCHDOG_INACTIVE_PROBE_STOP_REASON,
+		);
+		if (stoppedWorkers <= 0) return;
 
-	const inactiveForMs = Date.now() - heartbeatAt;
-	if (inactiveForMs < WATCHDOG_INACTIVE_TIMEOUT_MS) return;
+		run.phase = "working";
+		run.awaitingVerification = false;
+		run.verificationReminderSent = false;
+		run.activeAsyncId = null;
+		run.activeAsyncDir = null;
+		run.latestAsyncId = runningKnownRun.id;
+		run.latestAsyncDir = runningKnownRun.dir;
+		run.inactiveProbe = null;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] ${inactiveProbe.reason}; replacement requested`;
+		refreshStatus();
+		if (latestCtx?.hasUI) {
+			latestCtx.ui.notify(
+				`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} ${inactiveProbe.reason}. Stopped it and requested a replacement worker.`,
+				"warning",
+			);
+		}
+		sendGoalDrivenFollowUp(pi, buildInactiveProbeReplacementInstruction(inactiveProbe));
+		return;
+	} else if (heartbeatAt !== null && now - heartbeatAt >= WATCHDOG_INACTIVE_TIMEOUT_MS) {
+		const stoppedWorkers = await stopKnownAsyncRuns(run, WATCHDOG_STOP_REASON);
+		if (stoppedWorkers <= 0) return;
 
-	const stoppedWorkers = await stopKnownAsyncRuns(run, WATCHDOG_STOP_REASON);
+		run.phase = "working";
+		run.awaitingVerification = false;
+		run.verificationReminderSent = false;
+		run.activeAsyncId = null;
+		run.activeAsyncDir = null;
+		run.latestAsyncId = runningKnownRun.id;
+		run.latestAsyncDir = runningKnownRun.dir;
+		run.inactiveProbe = null;
+		run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] inactive for ${formatInactivity(now - heartbeatAt)}; replacement requested`;
+		refreshStatus();
+		if (latestCtx?.hasUI) {
+			latestCtx.ui.notify(
+				`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was inactive for ${formatInactivity(now - heartbeatAt)}. Stopped it and requested a replacement worker.`,
+				"warning",
+			);
+		}
+		sendGoalDrivenFollowUp(
+			pi,
+			"The previous worker became inactive and was stopped by the Goal-Driven watchdog. Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
+		);
+		return;
+	}
+
+	const inspection = await inspectAsyncRunForBusyStall(runningKnownRun.id, runningKnownRun.dir);
+	if (!inspection) return;
+	const busyStall = classifyBusyStall(inspection);
+	if (busyStall.classification !== "busy-stall") return;
+
+	const nextRecoveryCount = run.busyStallRecoveries + 1;
+	const replacementRequested = nextRecoveryCount <= WATCHDOG_BUSY_STALL_MAX_RECOVERIES;
+	const stoppedWorkers = await stopKnownAsyncRuns(run, WATCHDOG_BUSY_STALL_STOP_REASON);
 	if (stoppedWorkers <= 0) return;
 
+	run.busyStallRecoveries = nextRecoveryCount;
 	run.phase = "working";
 	run.awaitingVerification = false;
 	run.verificationReminderSent = false;
@@ -694,17 +1155,32 @@ async function watchdogTick(pi: ExtensionAPI): Promise<void> {
 	run.activeAsyncDir = null;
 	run.latestAsyncId = runningKnownRun.id;
 	run.latestAsyncDir = runningKnownRun.dir;
-	run.lastEvent = `Worker [${runningKnownRun.id.slice(0, 6)}] inactive for ${formatInactivity(inactiveForMs)}; replacement requested`;
+	run.lastEvent = replacementRequested
+		? `Worker [${runningKnownRun.id.slice(0, 6)}] busy-stalled; replacement requested`
+		: `Worker [${runningKnownRun.id.slice(0, 6)}] busy-stalled; awaiting attention`;
+	pi.appendEntry<GoalDrivenBusyStallEntry>(GOAL_DRIVEN_BUSY_STALL_ENTRY, buildBusyStallEntry({
+		run,
+		knownRun: runningKnownRun,
+		inspection,
+		diagnostic: busyStall,
+		stoppedAt: Date.now(),
+		recoveryCount: nextRecoveryCount,
+		replacementRequested,
+	}));
 	refreshStatus();
 	if (latestCtx?.hasUI) {
 		latestCtx.ui.notify(
-			`Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was inactive for ${formatInactivity(inactiveForMs)}. Stopped it and requested a replacement worker.`,
+			replacementRequested
+				? `Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was busy-stalled. Stopped it and requested a narrower replacement worker.`
+				: `Goal-Driven worker ${runningKnownRun.id.slice(0, 6)} was busy-stalled again. Stopped it and paused automatic replacement.`,
 			"warning",
 		);
 	}
 	sendGoalDrivenFollowUp(
 		pi,
-		"The previous worker became inactive and was stopped by the Goal-Driven watchdog. Launch exactly one replacement worker subagent with agent: \"worker\", async: true, and clarify: false, then stop.",
+		replacementRequested
+			? buildBusyStallReplacementInstruction(busyStall, nextRecoveryCount)
+			: buildBusyStallEscalationInstruction(busyStall),
 	);
 }
 
@@ -1292,6 +1768,8 @@ async function runSavedPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 		latestAsyncId: null,
 		latestAsyncDir: null,
 		knownAsyncRuns: [],
+		busyStallRecoveries: 0,
+		inactiveProbe: null,
 		lastEvent: "Launching master/subagent run",
 	};
 	await hydrateKnownAsyncRuns(activeRun, ctx.sessionManager);
@@ -1377,6 +1855,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.verificationReminderSent = false;
 			activeRun.activeAsyncId = runningKnownRun.id;
 			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
 			refreshStatus();
 			return { block: true, reason: `Goal-Driven worker ${runningKnownRun.id} is still running in background.` };
@@ -1389,6 +1868,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.phase = "working";
 		activeRun.awaitingVerification = false;
 		activeRun.verificationReminderSent = false;
+		activeRun.inactiveProbe = null;
 		activeRun.lastEvent = `Worker subagent attempt #${activeRun.attempt} launching in background`;
 		refreshStatus();
 	});
@@ -1418,6 +1898,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.verificationReminderSent = false;
 			activeRun.activeAsyncId = null;
 			activeRun.activeAsyncDir = null;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} failed to launch in async mode`;
 			refreshStatus();
 			sendGoalDrivenFollowUp(
@@ -1439,6 +1920,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.verificationReminderSent = false;
 		activeRun.activeAsyncId = launch.asyncId;
 		activeRun.activeAsyncDir = launch.asyncDir;
+		activeRun.inactiveProbe = null;
 		activeRun.lastEvent = `Worker subagent attempt #${Math.max(activeRun.attempt, 1)} running in background [${launch.asyncId.slice(0, 6)}]`;
 		refreshStatus();
 		ensureWatchdog(pi);
@@ -1456,6 +1938,8 @@ export default function goalDriven(pi: ExtensionAPI): void {
 		activeRun.awaitingVerification = true;
 		activeRun.verificationReminders = 0;
 		activeRun.verificationReminderSent = false;
+		activeRun.busyStallRecoveries = 0;
+		activeRun.inactiveProbe = null;
 		activeRun.activeAsyncId = null;
 		activeRun.activeAsyncDir = result.asyncDir ?? activeRun.latestAsyncDir ?? activeRun.activeAsyncDir;
 		activeRun.latestAsyncId = result.id;
@@ -1568,6 +2052,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.phase = "working";
 			activeRun.activeAsyncId = runningKnownRun.id;
 			activeRun.activeAsyncDir = runningKnownRun.dir;
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Recovered still-running worker [${runningKnownRun.id.slice(0, 6)}]`;
 			refreshStatus();
 			return;
@@ -1577,6 +2062,7 @@ export default function goalDriven(pi: ExtensionAPI): void {
 			activeRun.awaitingVerification = false;
 			activeRun.verificationReminderSent = false;
 			activeRun.phase = "working";
+			activeRun.inactiveProbe = null;
 			activeRun.lastEvent = `Master requested another worker attempt after verification`;
 			refreshStatus();
 			return;
@@ -1657,14 +2143,33 @@ export default function goalDriven(pi: ExtensionAPI): void {
 	});
 }
 
+async function runWatchdogTickForTest(run: ActiveRun, pi: ExtensionAPI, sessionManager?: SessionManagerView | null): Promise<ActiveRun | null> {
+	activeRun = run;
+	latestCtx = { sessionManager, hasUI: false } as ExtensionContext;
+	await watchdogTick(pi);
+	const result = activeRun;
+	latestCtx = null;
+	activeRun = null;
+	return result;
+}
+
 export const __goalDrivenTestUtils = {
 	GOAL_DRIVEN_WORKER_TASK_GUARD,
+	WATCHDOG_INACTIVE_PROBE_AFTER_MS,
+	WATCHDOG_INACTIVE_GRACE_MS,
 	prependWorkerTaskGuard,
 	collectPersistedKnownAsyncRuns,
 	matchesSessionRef,
 	getSessionTreeRoot,
 	formatAsyncRunCleanupSummary,
 	formatScopedSubagentStatusList,
+	probeInactiveAsyncRun,
+	buildInactiveProbeReplacementInstruction,
+	runWatchdogTickForTest,
+	inspectAsyncRunForBusyStall,
+	classifyBusyStall,
+	buildBusyStallReplacementInstruction,
+	buildBusyStallEscalationInstruction,
 	sanitizeBrainstormPrompt,
 	parsePromptSections,
 	shouldAutoDraftBrainstorm,

@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { __goalDrivenTestUtils } from "./index.ts";
 
 test("worker task guard is prepended once", () => {
@@ -105,6 +108,214 @@ test("formatScopedSubagentStatusList reports only session-scoped runs", () => {
 		__goalDrivenTestUtils.formatScopedSubagentStatusList([]),
 		"No active async runs in this Goal-Driven session tree.",
 	);
+});
+
+test("formatScopedSubagentStatusList reports possible busy stalls", () => {
+	assert.equal(
+		__goalDrivenTestUtils.formatScopedSubagentStatusList([
+			{
+				id: "run-a",
+				state: "running",
+				mode: "single",
+				currentStep: 0,
+				totalSteps: 1,
+				cwd: "/repo",
+				startedAt: 123,
+				busyStall: "possible-busy-stall",
+				busyStallReason: "repeated 12 low-progress events over 10m",
+				steps: [{ agent: "worker", status: "running" }],
+			},
+		]),
+		"Active async runs in this Goal-Driven session tree: 1\n\n- run-a | running | single | step 1/1 | /repo | possible-busy-stall: repeated 12 low-progress events over 10m\n  1. worker | running",
+	);
+});
+
+test("inspectAsyncRunForBusyStall reads bounded status, events, and output evidence", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "goal-driven-busy-stall-"));
+	const asyncDir = path.join(root, "run-a");
+	await mkdir(asyncDir);
+	const now = Date.now();
+	await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+		state: "running",
+		pid: 1234,
+		cwd: "/repo",
+		startedAt: now - 31 * 60 * 1000,
+		outputFile: "output-0.log",
+	}), "utf8");
+	await writeFile(path.join(asyncDir, "events.jsonl"), [
+		"not json",
+		JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "git show HEAD:index.ts | grep watchdog" } }),
+		JSON.stringify({ type: "subagent.child.stdout", line: "exit: 0" }),
+	].join("\n"), "utf8");
+	await writeFile(path.join(asyncDir, "output-0.log"), "exit: 0\nexit: 0\n", "utf8");
+
+	const inspection = await __goalDrivenTestUtils.inspectAsyncRunForBusyStall("run-a", asyncDir, now);
+	assert.equal(inspection?.pid, 1234);
+	assert.equal(inspection?.cwd, "/repo");
+	assert.equal(inspection?.recentToolSignatures.length, 1);
+	assert.match(inspection?.recentToolSignatures[0] ?? "", /git show HEAD:index\.ts/);
+	assert.deepEqual(inspection?.recentOutputLines.slice(-3), ["exit: 0", "exit: 0", "exit: 0"]);
+});
+
+test("classifyBusyStall distinguishes busy, possible, and healthy runs", () => {
+	const repeatedTool = "bash {\"command\":\"git show HEAD:index.ts | grep watchdog\"}";
+	const baseInspection = {
+		id: "run-a",
+		asyncDir: "/tmp/run-a",
+		state: "running",
+		pid: 1234,
+		cwd: "/repo",
+		startedAt: 1,
+		recentOutputLines: [],
+		evidence: [`tool: ${repeatedTool}`],
+	};
+
+	assert.equal(
+		__goalDrivenTestUtils.classifyBusyStall({
+			...baseInspection,
+			elapsedMs: 31 * 60 * 1000,
+			recentToolSignatures: Array.from({ length: 30 }, () => repeatedTool),
+		} as never).classification,
+		"busy-stall",
+	);
+	assert.equal(
+		__goalDrivenTestUtils.classifyBusyStall({
+			...baseInspection,
+			elapsedMs: 11 * 60 * 1000,
+			recentToolSignatures: Array.from({ length: 12 }, () => repeatedTool),
+		} as never).classification,
+		"possible-busy-stall",
+	);
+	assert.equal(
+		__goalDrivenTestUtils.classifyBusyStall({
+			...baseInspection,
+			elapsedMs: 31 * 60 * 1000,
+			recentToolSignatures: Array.from({ length: 30 }, (_, index) => `${repeatedTool}-${index}`),
+		} as never).classification,
+		"healthy",
+	);
+});
+
+test("inactive heartbeat probe classifies pending, resumed, stale, and expired workers", () => {
+	const now = 10_000_000;
+	const staleHeartbeat = now - __goalDrivenTestUtils.WATCHDOG_INACTIVE_PROBE_AFTER_MS - 1;
+	const snapshot = {
+		state: "running",
+		lastUpdate: staleHeartbeat,
+		pid: 1234,
+		outputFile: null,
+	} as const;
+
+	const pending = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: null,
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(pending.classification, "probe-pending");
+	assert.equal(pending.probe?.asyncId, "run-a");
+
+	const resumed = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: now - 1_000,
+		previousProbe: pending.probe ?? null,
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(resumed.classification, "active");
+
+	const stale = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: null,
+		now,
+		pidAlive: () => false,
+	});
+	assert.equal(stale.classification, "stale-running");
+	assert.match(stale.reason, /PID 1234/);
+
+	const expired = __goalDrivenTestUtils.probeInactiveAsyncRun({
+		asyncId: "run-a",
+		snapshot,
+		heartbeatAt: staleHeartbeat,
+		previousProbe: { ...pending.probe!, graceUntil: now - 1 },
+		now,
+		pidAlive: () => true,
+	});
+	assert.equal(expired.classification, "inactive-expired");
+});
+
+test("watchdog end-to-end recovers a stale running async worker with dead PID", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "goal-driven-stale-worker-"));
+	const asyncDir = path.join(root, "run-a");
+	await mkdir(asyncDir);
+	const now = Date.now();
+	await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+		state: "running",
+		pid: 9_999_999,
+		lastUpdate: now - __goalDrivenTestUtils.WATCHDOG_INACTIVE_PROBE_AFTER_MS - 1_000,
+		steps: [{ agent: "worker", status: "running", startedAt: now - 10_000 }],
+	}), "utf8");
+
+	const sentMessages: string[] = [];
+	const run = {
+		cwd: "/repo",
+		sessionId: "session-a",
+		sessionFile: "/tmp/session-a.jsonl",
+		goal: "Ship feature",
+		criteria: "Tests pass",
+		attempt: 1,
+		phase: "working",
+		awaitingVerification: false,
+		verificationReminders: 0,
+		verificationReminderSent: false,
+		activeAsyncId: "run-a",
+		activeAsyncDir: asyncDir,
+		latestAsyncId: "run-a",
+		latestAsyncDir: asyncDir,
+		knownAsyncRuns: [{ id: "run-a", dir: asyncDir }],
+		busyStallRecoveries: 0,
+		inactiveProbe: null,
+		lastEvent: "running",
+	};
+	const pi = {
+		sendMessage(message: { content?: string }) {
+			sentMessages.push(message.content ?? "");
+		},
+	} as never;
+
+	const result = await __goalDrivenTestUtils.runWatchdogTickForTest(run as never, pi);
+	const status = JSON.parse(await readFile(path.join(asyncDir, "status.json"), "utf8")) as { state?: string; error?: string; steps?: Array<{ status?: string }> };
+
+	assert.equal(status.state, "failed");
+	assert.equal(status.error, "Stopped by Goal-Driven stale-running watchdog");
+	assert.equal(status.steps?.[0]?.status, "failed");
+	assert.equal(result?.activeAsyncId, null);
+	assert.match(result?.lastEvent ?? "", /PID 9999999 is no longer alive; replacement requested/);
+	assert.equal(sentMessages.length, 1);
+	assert.match(sentMessages[0], /Launch exactly one replacement worker subagent/);
+	assert.match(sentMessages[0], /avoid repeating any silent long-running command without a timeout/);
+});
+
+test("busy-stall follow-up prompts separate replacement from escalation", () => {
+	const diagnostic = {
+		classification: "busy-stall",
+		reason: "repeated 30 low-progress events over 31m",
+		repeatedSignature: "output: exit: 0",
+		repeatCount: 30,
+		evidence: ["output: exit: 0"],
+	} as const;
+	const replacement = __goalDrivenTestUtils.buildBusyStallReplacementInstruction(diagnostic as never, 1);
+	assert.match(replacement, /Launch exactly one replacement worker subagent/);
+	assert.match(replacement, /must not repeat the same exploration loop/);
+
+	const escalation = __goalDrivenTestUtils.buildBusyStallEscalationInstruction(diagnostic as never);
+	assert.match(escalation, /Do not launch another replacement worker automatically/);
+	assert.doesNotMatch(escalation, /Launch exactly one replacement worker subagent/);
 });
 
 test("buildRunSystemPrompt and verification reminder emphasize session-tree scope", () => {

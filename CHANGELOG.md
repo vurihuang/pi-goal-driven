@@ -2,6 +2,32 @@
 
 All notable changes to `pi-goal-driven` are documented here.
 
+## 0.5.3 - 2026-04-30
+
+### Summary
+
+This update hardens `/goal-driven:work` against async workers that stay technically active while making no useful progress, and against workers that stay marked as running while producing no observable activity.
+
+The motivating failure modes are workers that keep emitting repetitive command/output activity, such as repeated `git show ... | grep ...` checks and `exit: 0` lines, or workers that remain silent after their recorded process has gone stale. Goal-Driven now treats those as recoverable worker stalls instead of waiting indefinitely.
+
+### Changed
+
+- Added busy-stall detection for session-owned async workers.
+  - Goal-Driven now inspects bounded tails of `pi-subagents` async artifacts (`status.json`, `events.jsonl`, and the current output log) to detect repeated low-progress tool/output patterns.
+  - Quiet inactivity is still handled by the existing inactivity watchdog; busy-stall detection covers workers that keep producing repetitive but unproductive activity.
+- Added diagnostic preservation before auto-stopping a busy-stalled worker.
+  - The diagnostic entry records the async ID, async directory, PID, cwd, elapsed time, repeated signature, repeat count, evidence sample, recovery count, and whether a replacement was requested.
+- Added narrower recovery prompts for busy-stalled workers.
+  - Replacement workers are told not to repeat the same exploration loop and to choose the smallest concrete fix or verification path for the master to verify.
+- Added a cap on consecutive busy-stall recoveries.
+  - After repeated busy-stall replacements, Goal-Driven stops relaunching automatically and escalates for master/user attention instead of looping forever.
+- Added heartbeat probing for inactive running workers.
+  - Goal-Driven now records a bounded probe window before stopping a quiet worker, clears the probe if activity resumes, and treats missing/dead worker PIDs as stale-running recovery cases.
+- Improved session-scoped status output.
+  - `subagent_status list` can now surface `possible-busy-stall` when a worker shows suspicious repeated low-progress activity before the auto-stop threshold is reached.
+  - Inactive workers can now surface probe-pending, stale-running, or inactive-expired status details before recovery.
+- Added regression coverage for async artifact inspection, busy-stall classification, inactive worker probing, status rendering, replacement prompts, and escalation prompts.
+
 ## 0.5.1 - 2026-04-23
 
 ### Summary
