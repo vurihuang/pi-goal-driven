@@ -15,7 +15,7 @@ https://github.com/user-attachments/assets/da5a59bd-7ea8-4a65-a9bb-490461cf5daf
 ## Version notes
 
 - Previous version on `origin/master`: `0.2.0`
-- Current version in this codebase: `0.5.1`
+- Current version in this codebase: `0.5.3`
 - Detailed release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## What it does

@@ -2,13 +2,13 @@
 
 All notable changes to `pi-goal-driven` are documented here.
 
-## Unreleased - 2026-04-24
+## 0.5.3 - 2026-04-30
 
 ### Summary
 
-This update hardens `/goal-driven:work` against async workers that stay technically active while making no useful progress.
+This update hardens `/goal-driven:work` against async workers that stay technically active while making no useful progress, and against workers that stay marked as running while producing no observable activity.
 
-The motivating failure mode is a worker that keeps emitting repetitive command/output activity, such as repeated `git show ... | grep ...` checks and `exit: 0` lines, without producing a final report or verifiable fix. Goal-Driven now treats that as a busy-stall condition instead of waiting indefinitely.
+The motivating failure modes are workers that keep emitting repetitive command/output activity, such as repeated `git show ... | grep ...` checks and `exit: 0` lines, or workers that remain silent after their recorded process has gone stale. Goal-Driven now treats those as recoverable worker stalls instead of waiting indefinitely.
 
 ### Changed
 
@@ -21,9 +21,12 @@ The motivating failure mode is a worker that keeps emitting repetitive command/o
   - Replacement workers are told not to repeat the same exploration loop and to choose the smallest concrete fix or verification path for the master to verify.
 - Added a cap on consecutive busy-stall recoveries.
   - After repeated busy-stall replacements, Goal-Driven stops relaunching automatically and escalates for master/user attention instead of looping forever.
+- Added heartbeat probing for inactive running workers.
+  - Goal-Driven now records a bounded probe window before stopping a quiet worker, clears the probe if activity resumes, and treats missing/dead worker PIDs as stale-running recovery cases.
 - Improved session-scoped status output.
   - `subagent_status list` can now surface `possible-busy-stall` when a worker shows suspicious repeated low-progress activity before the auto-stop threshold is reached.
-- Added regression coverage for async artifact inspection, busy-stall classification, status rendering, replacement prompts, and escalation prompts.
+  - Inactive workers can now surface probe-pending, stale-running, or inactive-expired status details before recovery.
+- Added regression coverage for async artifact inspection, busy-stall classification, inactive worker probing, status rendering, replacement prompts, and escalation prompts.
 
 ## 0.5.1 - 2026-04-23
 
